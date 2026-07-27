@@ -1,128 +1,251 @@
 """
-PRICE ALERT BOT - Código Completo
-Rastreia preços em Amazon, Mercado Livre e Shopee
-Manda alertas quando encontra bom desconto
+PRICE ALERT BOT
+Descobre produtos mais vendidos da Amazon BR, monitora preços
+e envia alertas quando detecta desconto.
 """
 
 import os
+import random
 import logging
+import statistics
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
+from bson import ObjectId
 import requests
 from bs4 import BeautifulSoup
 import asyncio
-from typing import Optional, Dict, List
-import json
+from typing import Optional, Dict, List, Tuple
 
-# Carregar variáveis de ambiente
 load_dotenv()
 
-# Configurações
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017/price_alert_bot")
-AWS_ASSOCIATE_TAG = os.getenv("AMAZON_ASSOCIATE_TAG", "default-tag")
-MERCADOLIVRE_CLIENT_ID = os.getenv("MERCADOLIVRE_CLIENT_ID", "")
-SHOPEE_PARTNER_ID = os.getenv("SHOPEE_PARTNER_ID", "")
+AWS_ASSOCIATE_TAG = os.getenv("AMAZON_ASSOCIATE_TAG", "")
 
-# Logging
+# Config do detector de desconto
+DISCOUNT_THRESHOLD = 0.85       # preço atual < 85% da referência = desconto (queda de 15%+)
+MIN_HISTORY_POINTS = 5          # mínimo de leituras pra usar média histórica
+BESTSELLERS_LIMIT = 20          # top N por categoria da Amazon
+SCRAPE_DELAY_RANGE = (2, 4)     # delay aleatório entre requests (segundos)
+
+# Amazon: URLs de bestsellers por categoria (mais variedade que a home)
+AMAZON_BESTSELLER_URLS = [
+    "https://www.amazon.com.br/gp/bestsellers/electronics/",
+    "https://www.amazon.com.br/gp/bestsellers/computers/",
+    "https://www.amazon.com.br/gp/bestsellers/home/",
+    "https://www.amazon.com.br/gp/bestsellers/beauty/",
+    "https://www.amazon.com.br/gp/bestsellers/sports/",
+]
+
+# Mercado Livre: IDs de categorias oficiais (site MLB = Brasil)
+# Referência: https://api.mercadolibre.com/sites/MLB/categories
+MERCADOLIVRE_CATEGORIES = {
+    'MLB1051': 'celulares',
+    'MLB1648': 'informatica',
+    'MLB1000': 'eletronicos',
+    'MLB1574': 'casa',
+    'MLB1246': 'beleza',
+    'MLB1276': 'esportes',
+}
+MERCADOLIVRE_AFFILIATE_TAG = os.getenv("MERCADOLIVRE_AFFILIATE_TAG", "")
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Estados da conversa
-ADD_PRODUCT_NAME, ADD_PRODUCT_CATEGORY, ADD_PRODUCT_AMAZON, ADD_PRODUCT_ML, ADD_PRODUCT_SHOPEE, ADD_PRODUCT_DISCOUNT = range(6)
+# Estados de conversas
+ADD_PRODUCT_NAME, ADD_PRODUCT_CATEGORY, ADD_PRODUCT_AMAZON, ADD_PRODUCT_ML, ADD_PRODUCT_SHOPEE, ADD_PRODUCT_DISCOUNT, REMOVE_PRODUCT_NAME = range(7)
 
-#mongodb
+
+# ==================== DATABASE ====================
 class Database:
     def __init__(self, url):
         try:
             self.client = MongoClient(url, serverSelectionTimeoutMS=5000)
-            # Test connection
             self.client.admin.command('ping')
             self.db = self.client['price_alert_bot']
             logger.info("✅ Conectado ao MongoDB")
         except ServerSelectionTimeoutError:
-            logger.warning("⚠️ MongoDB offline, usando modo local")
+            logger.warning("⚠️ MongoDB offline")
             self.db = None
 
+    # ---------- Produtos ----------
+    def upsert_product(self, product: dict) -> Optional[ObjectId]:
+        """Insere produto novo ou atualiza last_seen se já existe (usa URL como chave)."""
+        if self.db is None:
+            return None
+        try:
+            now = datetime.now()
+            set_fields = {
+                'name': product['name'],
+                'marketplace': product['marketplace'],
+                'category': product.get('category'),
+                'last_seen': now,
+                'active': True,
+            }
+            # Campos opcionais que só entram se vieram
+            if product.get('ml_item_id'):
+                set_fields['ml_item_id'] = product['ml_item_id']
+            if product.get('image_url'):
+                set_fields['image_url'] = product['image_url']
+
+            result = self.db.products.update_one(
+                {'url': product['url']},
+                {
+                    '$set': set_fields,
+                    '$setOnInsert': {
+                        'url': product['url'],
+                        'source': product.get('source', 'bestseller'),
+                        'first_seen': now,
+                    }
+                },
+                upsert=True
+            )
+            if result.upserted_id:
+                return result.upserted_id
+            doc = self.db.products.find_one({'url': product['url']}, {'_id': 1})
+            return doc['_id'] if doc else None
+        except Exception as e:
+            logger.error(f"Erro em upsert_product: {e}")
+            return None
+
+    def get_active_products(self) -> List[dict]:
+        if self.db is None:
+            return []
+        try:
+            return list(self.db.products.find({'active': True}))
+        except Exception as e:
+            logger.error(f"Erro get_active_products: {e}")
+            return []
+
+    def get_products(self) -> List[dict]:
+        """Alias mantido pra compatibilidade com /list_products e /stats."""
+        return self.get_active_products()
+
+    def delete_product_by_name(self, name: str) -> bool:
+        if self.db is None:
+            return False
+        try:
+            result = self.db.products.delete_one({
+                'name': {'$regex': f'^{name}$', '$options': 'i'}
+            })
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Erro delete_product_by_name: {e}")
+            return False
+
     def add_product(self, product: dict) -> bool:
-        """Adiciona um produto ao banco"""
-        if not self.db:
+        """Insere produto manual (via /add_product) — mantém compatibilidade."""
+        if self.db is None:
             return False
         try:
             self.db.products.insert_one({
                 **product,
-                'created_at': datetime.now(),
-                'last_checked': None,
-                'last_prices': {'amazon': None, 'mercadolivre': None, 'shopee': None}
+                'source': 'manual',
+                'active': True,
+                'first_seen': datetime.now(),
+                'last_seen': datetime.now(),
             })
             return True
         except Exception as e:
-            logger.error(f"Erro ao adicionar produto: {e}")
+            logger.error(f"Erro add_product: {e}")
             return False
 
-    def get_products(self) -> List[dict]:
-        """Pega todos os produtos"""
-        if not self.db:
-            return []
-        try:
-            return list(self.db.products.find())
-        except Exception as e:
-            logger.error(f"Erro ao pegar produtos: {e}")
-            return []
-
-    def update_product_prices(self, product_id: str, prices: dict):
-        """Atualiza preços de um produto"""
-        if not self.db:
+    # ---------- Histórico de preços ----------
+    def add_price_history(self, product_id: ObjectId, marketplace: str, price: float, list_price: Optional[float] = None, image_url: Optional[str] = None):
+        if self.db is None:
             return
         try:
-            self.db.products.update_one(
-                {'_id': product_id},
-                {'$set': {
-                    'last_prices': prices,
-                    'last_checked': datetime.now()
-                }}
-            )
+            self.db.price_history.insert_one({
+                'product_id': product_id,
+                'marketplace': marketplace,
+                'price': price,
+                'list_price': list_price,
+                'checked_at': datetime.now(),
+            })
+            update = {'current_price': price, 'last_checked': datetime.now()}
+            if list_price:
+                update['list_price'] = list_price
+            if image_url:
+                update['image_url'] = image_url
+            self.db.products.update_one({'_id': product_id}, {'$set': update})
         except Exception as e:
-            logger.error(f"Erro ao atualizar preços: {e}")
+            logger.error(f"Erro add_price_history: {e}")
 
+    def get_price_history(self, product_id: ObjectId, days: int = 30) -> List[float]:
+        if self.db is None:
+            return []
+        try:
+            cutoff = datetime.now() - timedelta(days=days)
+            docs = self.db.price_history.find(
+                {'product_id': product_id, 'checked_at': {'$gte': cutoff}},
+                {'price': 1}
+            )
+            return [d['price'] for d in docs if d.get('price')]
+        except Exception as e:
+            logger.error(f"Erro get_price_history: {e}")
+            return []
+
+    # ---------- Usuários ----------
     def add_user(self, user_id: int, username: str = None):
-        """Adiciona/atualiza usuário"""
-        if not self.db:
+        if self.db is None:
             return
         try:
             self.db.users.update_one(
                 {'user_id': user_id},
-                {'$set': {
-                    'username': username,
-                    'joined_at': datetime.now(),
-                    'last_active': datetime.now(),
-                    'is_active': True
-                }},
+                {
+                    '$set': {
+                        'username': username,
+                        'last_active': datetime.now(),
+                        'is_active': True
+                    },
+                    '$setOnInsert': {'joined_at': datetime.now()}
+                },
                 upsert=True
             )
         except Exception as e:
-            logger.error(f"Erro ao adicionar usuário: {e}")
+            logger.error(f"Erro add_user: {e}")
 
     def get_users_count(self) -> int:
-        """Conta usuários ativos"""
-        if not self.db:
+        if self.db is None:
             return 0
         try:
             return self.db.users.count_documents({'is_active': True})
-        except:
+        except Exception:
             return 0
 
-    def log_click(self, user_id: int, product_id: str, marketplace: str):
-        """Log de clique em produto"""
-        if not self.db:
+    def get_all_active_user_ids(self) -> List[int]:
+        if self.db is None:
+            return []
+        try:
+            return [u['user_id'] for u in self.db.users.find({'is_active': True}, {'user_id': 1})]
+        except Exception as e:
+            logger.error(f"Erro get_all_active_user_ids: {e}")
+            return []
+
+    def deactivate_user(self, user_id: int):
+        if self.db is None:
+            return
+        try:
+            self.db.users.update_one({'user_id': user_id}, {'$set': {'is_active': False}})
+        except Exception as e:
+            logger.error(f"Erro deactivate_user: {e}")
+
+    def log_click(self, user_id: int, product_id, marketplace: str):
+        if self.db is None:
             return
         try:
             self.db.clicks.insert_one({
@@ -132,377 +255,785 @@ class Database:
                 'clicked_at': datetime.now()
             })
         except Exception as e:
-            logger.error(f"Erro ao logar clique: {e}")
+            logger.error(f"Erro log_click: {e}")
 
-# ==================== SCRAPING DE PREÇOS ====================
+
+# ==================== SCRAPING ====================
+def _random_headers() -> dict:
+    return {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+
+
+def _http_get(url: str, tries: int = 3, timeout: int = 15) -> Optional[requests.Response]:
+    """GET com retry, headers rotativos e delay."""
+    for attempt in range(tries):
+        try:
+            resp = requests.get(url, headers=_random_headers(), timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            logger.debug(f"HTTP {resp.status_code} em {url} (tentativa {attempt + 1})")
+        except requests.RequestException as e:
+            logger.debug(f"Erro request {url}: {e}")
+        # backoff exponencial
+        asyncio_safe_sleep(2 ** attempt + random.random())
+    return None
+
+
+def asyncio_safe_sleep(seconds: float):
+    """Sleep síncrono usado em código chamado de async — usar time.sleep normal."""
+    import time
+    time.sleep(seconds)
+
+
+def _parse_price(text: str) -> Optional[float]:
+    """Extrai float de string tipo 'R$ 1.299,90' ou '1.299,90'."""
+    if not text:
+        return None
+    cleaned = text.replace('R$', '').replace('\xa0', '').strip()
+    # Remove todos os pontos (separador de milhar), troca vírgula por ponto
+    cleaned = cleaned.replace('.', '').replace(',', '.')
+    # Se sobrou algum caractere estranho, pega só dígitos e ponto
+    keep = ''
+    for c in cleaned:
+        if c.isdigit() or c == '.':
+            keep += c
+    try:
+        return float(keep) if keep else None
+    except ValueError:
+        return None
+
+
+class BestSellersScraper:
+    """Puxa lista de produtos populares da Amazon BR e do Mercado Livre."""
+
+    def get_amazon_bestsellers(self, limit: int = BESTSELLERS_LIMIT) -> List[dict]:
+        """Percorre categorias e junta os top produtos da Amazon."""
+        all_products = []
+        for category_url in AMAZON_BESTSELLER_URLS:
+            category = category_url.rstrip('/').split('/')[-1]
+            logger.info(f"🔎 Buscando bestsellers Amazon: {category}")
+            products = self._scrape_amazon_category(category_url, category, limit)
+            all_products.extend(products)
+            import time
+            time.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
+        logger.info(f"📦 Total Amazon: {len(all_products)}")
+        return all_products
+
+    def get_ml_bestsellers(self, limit: int = BESTSELLERS_LIMIT) -> List[dict]:
+        """Usa API pública do ML pra pegar mais vendidos por categoria."""
+        all_products = []
+        for cat_id, cat_name in MERCADOLIVRE_CATEGORIES.items():
+            logger.info(f"🔎 Buscando bestsellers ML: {cat_name}")
+            products = self._fetch_ml_category(cat_id, cat_name, limit)
+            all_products.extend(products)
+            import time
+            time.sleep(random.uniform(1, 2))
+        logger.info(f"📦 Total ML: {len(all_products)}")
+        return all_products
+
+    def _fetch_ml_category(self, category_id: str, category_name: str, limit: int) -> List[dict]:
+        url = f"https://api.mercadolibre.com/sites/MLB/search?category={category_id}&sort=sold_quantity_desc&limit={limit}&condition=new"
+        resp = _http_get(url)
+        if not resp:
+            logger.warning(f"❌ Falha API ML: {category_name}")
+            return []
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Erro parse JSON ML {category_name}: {e}")
+            return []
+
+        results = data.get('results', [])
+        products = []
+        for item in results:
+            title = item.get('title')
+            permalink = item.get('permalink')
+            if not title or not permalink:
+                continue
+            products.append({
+                'name': title[:200],
+                'url': permalink.split('?')[0],
+                'image_url': item.get('thumbnail'),
+                'marketplace': 'mercadolivre',
+                'category': category_name,
+                'source': 'bestseller',
+                'ml_item_id': item.get('id'),
+                'initial_price': item.get('price'),
+                'initial_list_price': item.get('original_price'),
+            })
+        logger.info(f"📄 ML {category_name}: {len(products)} extraídos")
+        return products
+
+    def _scrape_amazon_category(self, url: str, category: str, limit: int) -> List[dict]:
+        resp = _http_get(url)
+        if not resp:
+            logger.warning(f"❌ Falha ao buscar {url}")
+            return []
+
+        html_text = resp.text
+        # Detecta bloqueio anti-bot
+        if 'captcha' in html_text.lower() or 'api-services-support' in html_text.lower():
+            logger.warning(f"🤖 Amazon retornou CAPTCHA/bloqueio em {category} (HTML {len(html_text)} bytes)")
+            return []
+
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        products = []
+
+        # Cards de bestseller — Amazon usa várias estruturas, tento múltiplos seletores
+        cards = soup.select('div[id^="p13n-asin-index-"]')
+        selector_used = 'p13n-asin-index'
+        if not cards:
+            cards = soup.select('.zg-grid-general-faceout')
+            selector_used = 'zg-grid-general-faceout'
+        if not cards:
+            cards = soup.select('[data-testid="zg-card-body"]')
+            selector_used = 'zg-card-body'
+        if not cards:
+            cards = soup.select('div.p13n-sc-uncoverable-faceout')
+            selector_used = 'p13n-sc-uncoverable-faceout'
+
+        for card in cards[:limit]:
+            # Link — qualquer <a> com href de produto (dp ou gp/product)
+            link_el = (
+                card.select_one('a[href*="/dp/"]') or
+                card.select_one('a[href*="/gp/product/"]')
+            )
+            if not link_el:
+                continue
+
+            href = link_el.get('href', '')
+            # Normaliza URL absoluta e remove querystring
+            if href.startswith('/'):
+                product_url = f"https://www.amazon.com.br{href.split('?')[0]}"
+            else:
+                product_url = href.split('?')[0]
+
+            # Nome — tenta em cascata: aria-label, alt de img, seletores de texto
+            name = link_el.get('aria-label') or link_el.get('title')
+            if not name:
+                for sel in [
+                    'div[data-testid="zg-card-title"]',
+                    '._cDEzb_p13n-sc-css-line-clamp-3_g3dy1',
+                    '._cDEzb_p13n-sc-css-line-clamp-4_2q2cc',
+                    '.p13n-sc-truncate-desktop-type2',
+                    '.p13n-sc-truncate',
+                    'div.a-row.a-size-small',
+                ]:
+                    el = card.select_one(sel)
+                    if el:
+                        name = el.get_text(strip=True)
+                        if name:
+                            break
+            img_el = card.select_one('img')
+            # Último recurso: alt do <img>
+            if not name and img_el:
+                name = img_el.get('alt', '').strip()
+
+            if not name or len(name) < 5:
+                continue
+
+            image_url = img_el.get('src') if img_el else None
+
+            products.append({
+                'name': name[:200],
+                'url': product_url,
+                'image_url': image_url,
+                'marketplace': 'amazon',
+                'category': category,
+                'source': 'bestseller',
+            })
+
+        logger.info(f"📄 {category}: HTML {len(html_text)} bytes, {len(cards)} cards ({selector_used}), {len(products)} extraídos")
+        return products
+
+
 class PriceScraper:
-    def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    """Busca preço atual de um produto por URL/ID."""
+
+    def get_price(self, product: dict) -> Optional[Dict]:
+        """Roteia pro scraper certo baseado no marketplace."""
+        marketplace = product.get('marketplace')
+        if marketplace == 'amazon':
+            return self.get_amazon_price(product['url'])
+        if marketplace == 'mercadolivre':
+            return self.get_ml_price(product)
+        return None
+
+    def get_ml_price(self, product: dict) -> Optional[Dict]:
+        """Usa API do ML pra pegar preço atualizado do item."""
+        item_id = product.get('ml_item_id')
+        if not item_id:
+            # Fallback: tenta extrair "MLB-NNN" ou "MLBNNN" da URL
+            import re
+            match = re.search(r'MLB-?(\d+)', product.get('url', ''))
+            if match:
+                item_id = f"MLB{match.group(1)}"
+
+        if not item_id:
+            return None
+
+        url = f"https://api.mercadolibre.com/items/{item_id}"
+        resp = _http_get(url)
+        if not resp:
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+
+        price = data.get('price')
+        list_price = data.get('original_price')
+        if not price:
+            return None
+
+        # Pega imagem em alta resolução do array 'pictures'
+        pictures = data.get('pictures') or []
+        image_url = None
+        if pictures:
+            image_url = pictures[0].get('secure_url') or pictures[0].get('url')
+        # Fallback: thumbnail se não achou nada
+        if not image_url:
+            image_url = data.get('thumbnail')
+
+        return {
+            'price': float(price),
+            'list_price': float(list_price) if list_price else None,
+            'image_url': image_url,
+            'marketplace': 'mercadolivre',
         }
 
-    async def get_amazon_price(self, url: str) -> Optional[Dict]:
-        """Extrai preço da Amazon"""
-        try:
-            if not url:
-                return None
-            
-            # Para ambiente de produção, use a Amazon API official
-            # Por enquanto, retornamos estrutura básica
-            # Em produção: use boto3 + Product Advertising API
-            
-            session = requests.Session()
-            session.headers.update(self.headers)
-            response = session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Busca preço (varia conforme página)
-                price_element = soup.find('span', class_='a-price-whole')
-                if price_element:
-                    price_text = price_element.get_text().strip()
-                    price = float(price_text.replace('R$', '').replace(',', '.').split()[0])
-                    return {'price': price, 'marketplace': 'amazon', 'url': url}
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Erro ao scrape Amazon: {e}")
+    def get_amazon_price(self, url: str) -> Optional[Dict]:
+        """Retorna preço atual + preço 'de/por' (list_price) da Amazon."""
+        resp = _http_get(url)
+        if not resp:
             return None
 
-    async def get_mercadolivre_price(self, url: str) -> Optional[Dict]:
-        """Extrai preço do Mercado Livre"""
-        try:
-            if not url:
-                return None
-            
-            session = requests.Session()
-            session.headers.update(self.headers)
-            response = session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Busca preço
-                price_element = soup.find('span', class_='price-tag-fraction')
-                if price_element:
-                    price_text = price_element.get_text().strip()
-                    price = float(price_text.replace(',', '.'))
-                    return {'price': price, 'marketplace': 'mercadolivre', 'url': url}
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Erro ao scrape Mercado Livre: {e}")
+        soup = BeautifulSoup(resp.content, 'html.parser')
+
+        # Preço atual — tenta seletores em cascata
+        price = None
+        for selector in [
+            'span.a-price-whole',
+            'span.a-offscreen',
+            'span[data-a-color="price"] span.a-offscreen',
+        ]:
+            el = soup.select_one(selector)
+            if el:
+                price = _parse_price(el.get_text())
+                if price:
+                    break
+
+        # Preço "de/por" (list price, riscado)
+        list_price = None
+        for selector in [
+            'span.a-price.a-text-price span.a-offscreen',
+            'span[data-a-strike="true"] span.a-offscreen',
+            '.basisPrice .a-offscreen',
+        ]:
+            el = soup.select_one(selector)
+            if el:
+                list_price = _parse_price(el.get_text())
+                if list_price and list_price > (price or 0):
+                    break
+                list_price = None
+
+        if not price:
             return None
 
-    async def get_shopee_price(self, url: str) -> Optional[Dict]:
-        """Extrai preço do Shopee (via API)"""
-        try:
-            if not url:
-                return None
-            
-            # Extrai item_id da URL
-            if 'shopee.com.br' in url:
-                # Format: shopee.com.br/produto-name-i.12345.67890
-                parts = url.split('-i.')
-                if len(parts) > 1:
-                    item_id = parts[1].split('.')[-1]
-                    
-                    # Usa API do Shopee
-                    api_url = f"https://shopee.com.br/api/v2/item/get?itemid={item_id}&shopid=1"
-                    response = requests.get(api_url, timeout=10)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get('data'):
-                            price = data['data'].get('price', 0) / 100000  # Shopee usa centavos
-                            return {'price': price, 'marketplace': 'shopee', 'url': url}
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Erro ao scrape Shopee: {e}")
-            return None
+        # Imagem principal (alta resolução) — data-old-hires quando existe, senão src
+        image_url = None
+        for selector in ['img#landingImage', 'img#imgBlkFront', 'img[data-old-hires]']:
+            img_el = soup.select_one(selector)
+            if img_el:
+                image_url = img_el.get('data-old-hires') or img_el.get('src')
+                if image_url:
+                    break
 
-    async def get_all_prices(self, product: dict) -> Dict:
-        """Pega preços de todos os marketplaces"""
-        prices = {}
-        
-        # Amazon
-        if product.get('amazon_url'):
-            amazon = await self.get_amazon_price(product['amazon_url'])
-            if amazon:
-                prices['amazon'] = amazon['price']
-        
-        # Mercado Livre
-        if product.get('mercadolivre_url'):
-            ml = await self.get_mercadolivre_price(product['mercadolivre_url'])
-            if ml:
-                prices['mercadolivre'] = ml['price']
-        
-        # Shopee
-        if product.get('shopee_url'):
-            shopee = await self.get_shopee_price(product['shopee_url'])
-            if shopee:
-                prices['shopee'] = shopee['price']
-        
-        return prices
+        return {'price': price, 'list_price': list_price, 'image_url': image_url, 'marketplace': 'amazon'}
+
+
+# ==================== DETECTOR DE DESCONTO ====================
+class DiscountDetector:
+    """Decide se o preço atual é desconto relevante."""
+
+    def check(self, product: dict, current_price: float, history: List[float]) -> Tuple[bool, Optional[str], Optional[float]]:
+        """
+        Retorna (é_desconto, motivo, percent_off).
+        Aplica 3 critérios em OR: média histórica, list_price (de/por), mínimo histórico.
+        """
+        # (a) Média histórica — só se tiver histórico suficiente
+        if len(history) >= MIN_HISTORY_POINTS:
+            avg = statistics.mean(history)
+            if current_price < avg * DISCOUNT_THRESHOLD:
+                percent_off = round((1 - current_price / avg) * 100)
+                return True, 'média histórica', percent_off
+
+        # (b) List price (de/por da Amazon)
+        list_price = product.get('list_price')
+        if list_price and current_price < list_price * DISCOUNT_THRESHOLD:
+            percent_off = round((1 - current_price / list_price) * 100)
+            return True, 'preço de/por', percent_off
+
+        # (c) Mínimo histórico — precisa de pelo menos 3 leituras pra fazer sentido
+        if len(history) >= 3:
+            min_hist = min(history)
+            if current_price <= min_hist and current_price < statistics.mean(history) * 0.95:
+                percent_off = round((1 - current_price / statistics.mean(history)) * 100)
+                return True, 'mínimo histórico', percent_off
+
+        return False, None, None
+
+
+# ==================== INSTÂNCIAS GLOBAIS ====================
+db = Database(MONGO_URL)
+bestseller_scraper = BestSellersScraper()
+price_scraper = PriceScraper()
+detector = DiscountDetector()
+
 
 # ==================== BOT HANDLERS ====================
-db = Database(MONGO_URL)
-scraper = PriceScraper()
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start"""
     user = update.effective_user
     db.add_user(user.id, user.username)
-    
+
     welcome_text = """
-🎯 **Bem-vindo ao Price Alert Bot!**
+🎯 <b>Bem-vindo ao Price Alert Bot!</b>
 
-Seu assistente de compras inteligente que rastreia preços em:
-✅ Amazon
-✅ Mercado Livre  
-✅ Shopee
+O bot descobre sozinho os produtos mais populares do Brasil e te avisa quando estão com desconto de verdade.
 
-Receba alertas quando encontrar bons descontos!
-
-**Comandos disponíveis:**
-/start - Reinicia o bot
-/add_product - Adicionar novo produto
+<b>Comandos:</b>
+/start - Reinicia
 /list_products - Ver produtos rastreados
-/remove_product - Remover um produto
-/stats - Ver estatísticas
+/stats - Estatísticas
 /help - Ajuda
+
+Você vai receber alertas automáticos às 08h, 12h e 18h quando o bot detectar boas ofertas.
     """
-    
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(welcome_text, parse_mode='HTML')
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /help"""
     help_text = """
-**📚 AJUDA - Como usar o bot**
+<b>📚 COMO FUNCIONA</b>
 
-1️⃣ **ADICIONAR PRODUTO**
-Comando: /add_product
-Você vai informar:
-- Nome do produto
-- Categoria (eletrônicos/suplementos/fitness)
-- Links nos 3 marketplaces
-- Desconto mínimo para alertar
+1️⃣ <b>DESCOBERTA</b>
+O bot puxa 1x/dia os produtos mais vendidos da Amazon BR (várias categorias).
 
-2️⃣ **ALERTAS AUTOMÁTICOS**
-O bot rastreia 24/7 e manda:
-- 08:00 - Melhor oferta matinal
-- 12:00 - Oferta do meio do dia
-- 18:00 - Oferta noturna
+2️⃣ <b>MONITORAMENTO</b>
+De 6h em 6h ele checa o preço atual de cada produto e salva no histórico.
 
-3️⃣ **COMO FUNCIONA**
-Quando você clica no link:
-- Você compra no melhor preço
-- Você aproveita o desconto
-- Ganhamos comissão automaticamente
+3️⃣ <b>DETECÇÃO DE DESCONTO</b>
+Considera desconto quando o preço cai 15%+ em relação a:
+- Média dos últimos 30 dias
+- Preço "de/por" original
+- Mínimo histórico
 
-**Dúvidas?** Envie uma mensagem!
+4️⃣ <b>ALERTAS</b>
+Às 08h, 12h e 18h você recebe uma mensagem agrupada com todos os produtos em oferta.
+
+<b>Dúvidas?</b> É só mandar mensagem.
     """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text, parse_mode='HTML')
 
+
+async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = db.get_active_products()
+    if not products:
+        await update.message.reply_text("📭 Ainda não tem produtos rastreados. O bot vai popular em breve.")
+        return
+
+    text = f"📊 <b>{len(products)} produtos rastreados</b>\n\n"
+    # Mostra só os 20 primeiros pra não estourar o limite de mensagem
+    for i, p in enumerate(products[:20], 1):
+        price = p.get('current_price')
+        price_txt = f" — R$ {price:.2f}" if price else ""
+        text += f"{i}. {p['name'][:60]}{price_txt}\n"
+    if len(products) > 20:
+        text += f"\n... e mais {len(products) - 20} produtos"
+
+    await update.message.reply_text(text, parse_mode='HTML')
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = db.get_active_products()
+    users = db.get_users_count()
+    with_price = sum(1 for p in products if p.get('current_price'))
+
+    stats_text = f"""
+📈 <b>ESTATÍSTICAS</b>
+
+👥 Usuários ativos: {users}
+📦 Produtos rastreados: {len(products)}
+💰 Com preço coletado: {with_price}
+⏰ Agora: {datetime.now().strftime('%d/%m %H:%M')}
+
+🎯 Próximos alertas: 08h, 12h, 18h
+    """
+    await update.message.reply_text(stats_text, parse_mode='HTML')
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Operação cancelada.")
+    return ConversationHandler.END
+
+
+# --- Comandos admin (rodar jobs manualmente pra testar) ---
+async def force_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🌱 Rodando seed de bestsellers agora...")
+    await seed_bestsellers_task(context)
+    await update.message.reply_text("✅ Seed concluído. Confere com /list_products.")
+
+
+async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Rodando check de preços agora (pode demorar alguns minutos)...")
+    await check_prices_task(context)
+    await update.message.reply_text("✅ Check concluído.")
+
+
+async def force_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📢 Rodando envio de alertas agora...")
+    await send_daily_alerts(context)
+    await update.message.reply_text("✅ Alertas processados.")
+
+
+# --- /add_product mantido como admin (útil pra testar / adicionar produtos fora do bestseller) ---
 async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia conversa de adicionar produto"""
-    await update.message.reply_text("📦 Qual o **nome do produto**?", parse_mode='Markdown')
+    await update.message.reply_text("📦 Qual o <b>nome do produto</b>?", parse_mode='HTML')
     return ADD_PRODUCT_NAME
 
+
 async def add_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe nome do produto"""
     context.user_data['product_name'] = update.message.text
-    
     keyboard = [
         [InlineKeyboardButton("Eletrônicos", callback_data='cat_eletronicos')],
-        [InlineKeyboardButton("Suplementos", callback_data='cat_suplementos')],
-        [InlineKeyboardButton("Fitness", callback_data='cat_fitness')]
+        [InlineKeyboardButton("Casa", callback_data='cat_casa')],
+        [InlineKeyboardButton("Outro", callback_data='cat_outro')],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text("Qual a **categoria**?", reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text(
+        "Qual a <b>categoria</b>?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
     return ADD_PRODUCT_CATEGORY
 
+
 async def add_product_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe categoria"""
     query = update.callback_query
-    category = query.data.replace('cat_', '')
-    context.user_data['category'] = category
-    
+    context.user_data['category'] = query.data.replace('cat_', '')
     await query.answer()
-    await query.edit_message_text("Link da **Amazon**? (ou 'skip' para pular)")
+    await query.edit_message_text("Link da <b>Amazon</b>? (ou 'skip')", parse_mode='HTML')
     return ADD_PRODUCT_AMAZON
 
+
 async def add_product_amazon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe link Amazon"""
-    url = update.message.text
+    url = update.message.text.strip()
     context.user_data['amazon_url'] = url if url.lower() != 'skip' else None
-    
-    await update.message.reply_text("Link do **Mercado Livre**? (ou 'skip')")
+    await update.message.reply_text("Link do <b>Mercado Livre</b>? (ou 'skip')", parse_mode='HTML')
     return ADD_PRODUCT_ML
 
+
 async def add_product_ml(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe link Mercado Livre"""
-    url = update.message.text
-    context.user_data['mercadolivre_url'] = url if url.lower() != 'skip' else None
-    
-    await update.message.reply_text("Link do **Shopee**? (ou 'skip')")
+    url = update.message.text.strip()
+    context.user_data['ml_url'] = url if url.lower() != 'skip' else None
+    await update.message.reply_text("Link da <b>Shopee</b>? (ou 'skip')", parse_mode='HTML')
     return ADD_PRODUCT_SHOPEE
 
+
 async def add_product_shopee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe link Shopee"""
-    url = update.message.text
+    url = update.message.text.strip()
     context.user_data['shopee_url'] = url if url.lower() != 'skip' else None
-    
     await update.message.reply_text("Desconto mínimo em %? (ex: 15)")
     return ADD_PRODUCT_DISCOUNT
 
+
 async def add_product_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recebe desconto mínimo e salva"""
     try:
         discount = int(update.message.text)
-        
-        product = {
-            'name': context.user_data['product_name'],
-            'category': context.user_data['category'],
-            'amazon_url': context.user_data.get('amazon_url'),
-            'mercadolivre_url': context.user_data.get('mercadolivre_url'),
-            'shopee_url': context.user_data.get('shopee_url'),
-            'min_discount': discount,
-            'active': True
-        }
-        
-        if db.add_product(product):
-            await update.message.reply_text(f"✅ Produto '{product['name']}' adicionado com sucesso!")
-        else:
-            await update.message.reply_text("❌ Erro ao adicionar produto")
-        
-        return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("❌ Digite um número válido")
         return ADD_PRODUCT_DISCOUNT
 
-async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista todos os produtos"""
-    products = db.get_products()
-    
+    # Salva com a URL Amazon como url principal (se tiver)
+    amazon_url = context.user_data.get('amazon_url')
+    if not amazon_url:
+        await update.message.reply_text("❌ Produto manual precisa ao menos da URL Amazon nessa versão.")
+        return ConversationHandler.END
+
+    product = {
+        'name': context.user_data['product_name'],
+        'url': amazon_url,
+        'marketplace': 'amazon',
+        'category': context.user_data['category'],
+        'min_discount': discount,
+    }
+    if db.add_product(product):
+        await update.message.reply_text(f"✅ Produto '{product['name']}' adicionado.")
+    else:
+        await update.message.reply_text("❌ Erro ao adicionar produto")
+    return ConversationHandler.END
+
+
+async def remove_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = db.get_active_products()
     if not products:
-        await update.message.reply_text("📭 Nenhum produto rastreado ainda")
-        return
-    
-    text = "📊 **Produtos em rastreamento:**\n\n"
-    for i, product in enumerate(products, 1):
-        text += f"{i}. **{product['name']}**\n"
-        text += f"   Categoria: {product['category']}\n"
-        text += f"   Desconto mín: {product['min_discount']}%\n"
-        text += f"   Status: {'✅ Ativo' if product['active'] else '❌ Inativo'}\n\n"
-    
-    await update.message.reply_text(text, parse_mode='Markdown')
+        await update.message.reply_text("📭 Nenhum produto pra remover.")
+        return ConversationHandler.END
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra estatísticas"""
-    products = db.get_products()
-    users = db.get_users_count()
-    
-    stats_text = f"""
-📈 **ESTATÍSTICAS**
+    text = "🗑️ <b>Produtos cadastrados:</b>\n\n"
+    for i, product in enumerate(products[:20], 1):
+        text += f"{i}. {product['name'][:60]}\n"
+    text += "\nDigite o <b>nome exato</b> do produto que quer remover (ou /cancel):"
+    await update.message.reply_text(text, parse_mode='HTML')
+    return REMOVE_PRODUCT_NAME
 
-👥 Usuários ativos: {users}
-📦 Produtos rastreando: {len(products)}
-⏰ Último update: {datetime.now().strftime('%H:%M:%S')}
 
-🎯 Próximo alerta: 08:00 amanhã
-    """
-    
-    await update.message.reply_text(stats_text, parse_mode='Markdown')
+async def remove_product_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if db.delete_product_by_name(name):
+        await update.message.reply_text(f"✅ Produto '{name}' removido.")
+    else:
+        await update.message.reply_text(f"❌ Não achei '{name}'. Confere com /list_products.")
+    return ConversationHandler.END
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tratamento de erros"""
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Erro: {context.error}")
-    await update.message.reply_text("❌ Ocorreu um erro. Tente novamente.")
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("❌ Ocorreu um erro. Tente novamente.")
+        except Exception:
+            pass
+
+
+# ==================== JOBS AGENDADOS ====================
+async def seed_bestsellers_task(context: ContextTypes.DEFAULT_TYPE):
+    """1x/dia: descobre novos bestsellers e adiciona/atualiza na DB."""
+    logger.info("🌱 Iniciando seed de bestsellers...")
+
+    amazon_products = await asyncio.to_thread(bestseller_scraper.get_amazon_bestsellers)
+    ml_products = await asyncio.to_thread(bestseller_scraper.get_ml_bestsellers)
+
+    all_products = amazon_products + ml_products
+    added = 0
+    for p in all_products:
+        product_id = db.upsert_product(p)
+        if not product_id:
+            continue
+        added += 1
+        # ML já vem com preço no bestseller — grava direto pra ganhar tempo
+        if p.get('initial_price') and p.get('marketplace') == 'mercadolivre':
+            db.add_price_history(
+                product_id,
+                'mercadolivre',
+                float(p['initial_price']),
+                float(p['initial_list_price']) if p.get('initial_list_price') else None
+            )
+    logger.info(f"🌱 Seed concluído — {added} produtos processados (Amazon {len(amazon_products)} + ML {len(ml_products)})")
+
 
 async def check_prices_task(context: ContextTypes.DEFAULT_TYPE):
-    """Task que roda a cada 6 horas checando preços"""
-    logger.info("🔍 Checando preços...")
-    
-    products = db.get_products()
-    
+    """A cada 6h: busca preço atual de cada produto ativo e grava no histórico."""
+    logger.info("🔍 Iniciando check de preços...")
+    products = db.get_active_products()
+    logger.info(f"🔍 {len(products)} produtos pra checar")
+
+    checked = 0
     for product in products:
         try:
-            prices = await scraper.get_all_prices(product)
-            
-            if prices:
-                db.update_product_prices(str(product.get('_id')), prices)
-                logger.info(f"✅ Preços de '{product['name']}' atualizados: {prices}")
+            data = await asyncio.to_thread(price_scraper.get_price, product)
+            if data:
+                db.add_price_history(
+                    product['_id'],
+                    data['marketplace'],
+                    data['price'],
+                    data.get('list_price'),
+                    data.get('image_url'),
+                )
+                checked += 1
+            # ML é API — pode ser mais rápido; Amazon precisa delay maior
+            if product.get('marketplace') == 'amazon':
+                await asyncio.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
+            else:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
         except Exception as e:
-            logger.error(f"Erro ao checar {product['name']}: {e}")
+            logger.error(f"Erro ao checar {product.get('name')}: {e}")
+
+    logger.info(f"🔍 Check concluído — {checked}/{len(products)} preços coletados")
+
+
+def _build_affiliate_url(url: str, marketplace: str = 'amazon') -> str:
+    if marketplace == 'amazon' and AWS_ASSOCIATE_TAG and 'amazon.com.br' in url:
+        separator = '&' if '?' in url else '?'
+        return f"{url}{separator}tag={AWS_ASSOCIATE_TAG}"
+    if marketplace == 'mercadolivre' and MERCADOLIVRE_AFFILIATE_TAG:
+        separator = '&' if '?' in url else '?'
+        return f"{url}{separator}matt_tool={MERCADOLIVRE_AFFILIATE_TAG}"
+    return url
+
+
+def _marketplace_emoji(marketplace: str) -> str:
+    return {'amazon': '🟠', 'mercadolivre': '🟡', 'shopee': '🔴'}.get(marketplace, '🛒')
+
 
 async def send_daily_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Task que manda alertas 2-3x por dia"""
-    logger.info("📢 Enviando alertas diários...")
-    
-    products = db.get_products()
-    
-    # Aqui você manda mensagens pra todos os usuários
-    # Exemplo: top 1 produto com melhor desconto
-    
-    if products:
-        best_product = products[0]  # Simplificado - em produção, calcula melhor desconto
-        
-        # Cria link de afiliado
-        affiliate_link = f"{best_product.get('amazon_url')}?tag={AWS_ASSOCIATE_TAG}"
-        
-        alert_text = f"""
-🚨 **ALERTA DE PREÇO**
+    """3x/dia: envia mensagem agrupada com todos os descontos detectados."""
+    logger.info("📢 Rodando envio de alertas...")
 
-{best_product['name']}
+    products = db.get_active_products()
+    discounts = []
 
-💰 Confira o desconto agora!
-[Ir para o melhor preço]({affiliate_link})
-        """
-        
-        logger.info(f"Alerta criado para: {best_product['name']}")
+    for p in products:
+        current = p.get('current_price')
+        if not current:
+            continue
+        history = db.get_price_history(p['_id'], days=30)
+        is_disc, reason, percent_off = detector.check(p, current, history)
+        if is_disc:
+            # Preço "de" pra mostrar: prefere list_price, senão média histórica
+            list_price = p.get('list_price')
+            if not list_price and history:
+                list_price = round(statistics.mean(history), 2)
+            discounts.append({
+                'name': p['name'],
+                'price': current,
+                'list_price': list_price,
+                'url': p['url'],
+                'image_url': p.get('image_url'),
+                'reason': reason,
+                'percent_off': percent_off,
+                'category': p.get('category', ''),
+                'marketplace': p.get('marketplace', 'amazon'),
+            })
+
+    if not discounts:
+        logger.info("📢 Nenhum desconto detectado, alerta pulado")
+        return
+
+    # Ordena por maior queda
+    discounts.sort(key=lambda d: d['percent_off'] or 0, reverse=True)
+
+    # Monta a msg agrupada (top 15 em lista)
+    lines = [f"🔥 <b>{len(discounts)} descontos detectados agora</b>\n"]
+    for i, d in enumerate(discounts[:15], 1):
+        affiliate_url = _build_affiliate_url(d['url'], d['marketplace'])
+        emoji = _marketplace_emoji(d['marketplace'])
+        if d.get('list_price') and d['list_price'] > d['price']:
+            price_line = f"   💰 De <s>R$ {d['list_price']:.2f}</s> | Por <b>R$ {d['price']:.2f}</b> (-{d['percent_off']}%)"
+        else:
+            price_line = f"   💰 <b>R$ {d['price']:.2f}</b> (-{d['percent_off']}% • {d['reason']})"
+        lines.append(f"{i}. {emoji} <b>{d['name'][:70]}</b>")
+        lines.append(price_line)
+        lines.append(f"   🛒 <a href=\"{affiliate_url}\">Ver oferta</a>\n")
+    if len(discounts) > 15:
+        lines.append(f"<i>...e mais {len(discounts) - 15} ofertas</i>")
+    text = "\n".join(lines)
+
+    # Top 3 do dia pra virar msg individual com foto
+    top_three = [d for d in discounts[:3] if d.get('image_url')]
+
+    user_ids = db.get_all_active_user_ids()
+    sent = 0
+    for user_id in user_ids:
+        try:
+            # Msg 1: lista agrupada
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            )
+            # Msgs 2-4: top 3 com foto individual
+            for d in top_three:
+                caption = _format_photo_caption(d)
+                try:
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=d['image_url'],
+                        caption=caption,
+                        parse_mode='HTML',
+                    )
+                except Exception as e:
+                    logger.warning(f"Falha ao enviar foto pra {user_id}: {e}")
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Falha ao enviar pra {user_id}: {e}")
+            if 'blocked' in str(e).lower() or 'forbidden' in str(e).lower():
+                db.deactivate_user(user_id)
+
+    logger.info(f"📢 Alertas enviados: {sent}/{len(user_ids)}")
+
+
+def _format_photo_caption(d: dict) -> str:
+    affiliate_url = _build_affiliate_url(d['url'], d['marketplace'])
+    emoji = _marketplace_emoji(d['marketplace'])
+    marketplace_name = {'amazon': 'Amazon', 'mercadolivre': 'Mercado Livre'}.get(d['marketplace'], 'Loja')
+    if d.get('list_price') and d['list_price'] > d['price']:
+        price_block = f"De <s>R$ {d['list_price']:.2f}</s> | Por <b>R$ {d['price']:.2f}</b> 💰"
+    else:
+        price_block = f"<b>R$ {d['price']:.2f}</b> 💰"
+    return (
+        f"{emoji} <b>{d['name'][:100]}</b>\n\n"
+        f"{price_block}\n"
+        f"🔻 <b>{d['percent_off']}% OFF</b>\n\n"
+        f"🛒 Achado na {marketplace_name}\n"
+        f"👉 <a href=\"{affiliate_url}\">Ver oferta</a>"
+    )
+
 
 # ==================== MAIN ====================
 def main():
-    """Inicia o bot"""
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Handlers de comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("list_products", list_products))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("force_seed", force_seed))
+    app.add_handler(CommandHandler("force_check", force_check))
+    app.add_handler(CommandHandler("force_alerts", force_alerts))
 
-    # Handler de conversa para adicionar produto
     add_product_handler = ConversationHandler(
         entry_points=[CommandHandler("add_product", add_product_start)],
         states={
             ADD_PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
-            ADD_PRODUCT_CATEGORY: [MessageHandler(filters.ALL, add_product_category)],
+            ADD_PRODUCT_CATEGORY: [CallbackQueryHandler(add_product_category, pattern=r'^cat_')],
             ADD_PRODUCT_AMAZON: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_amazon)],
             ADD_PRODUCT_ML: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_ml)],
             ADD_PRODUCT_SHOPEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_shopee)],
             ADD_PRODUCT_DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_discount)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(add_product_handler)
 
-    # Error handler
+    remove_product_handler = ConversationHandler(
+        entry_points=[CommandHandler("remove_product", remove_product_start)],
+        states={
+            REMOVE_PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_product_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(remove_product_handler)
+
     app.add_error_handler(error_handler)
 
-    # Jobs (tarefas agendadas)
+    # Jobs
     job_queue = app.job_queue
-    job_queue.run_repeating(check_prices_task, interval=21600, first=0)  # A cada 6h
+    # Seed inicial 30s depois de subir + 1x/dia (a cada 24h)
+    job_queue.run_repeating(seed_bestsellers_task, interval=86400, first=30)
+    # Check de preços a cada 6h — primeira execução 3min depois de subir (dá tempo do seed)
+    job_queue.run_repeating(check_prices_task, interval=21600, first=180)
+    # Alertas às 08/12/18h
     job_queue.run_daily(send_daily_alerts, time=datetime.strptime("08:00", "%H:%M").time())
     job_queue.run_daily(send_daily_alerts, time=datetime.strptime("12:00", "%H:%M").time())
     job_queue.run_daily(send_daily_alerts, time=datetime.strptime("18:00", "%H:%M").time())
 
     logger.info("🚀 Bot iniciado com sucesso!")
     app.run_polling()
+
 
 if __name__ == '__main__':
     main()
