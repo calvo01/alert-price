@@ -244,6 +244,55 @@ class Database:
         except Exception as e:
             logger.error(f"Erro deactivate_user: {e}")
 
+    # ---------- Dedupe de alertas ----------
+    def get_products_by_marketplace(self, marketplace: str) -> List[dict]:
+        if self.db is None:
+            return []
+        try:
+            return list(self.db.products.find({'active': True, 'marketplace': marketplace}))
+        except Exception as e:
+            logger.error(f"Erro get_products_by_marketplace: {e}")
+            return []
+
+    def should_alert(self, product: dict, current_price: float,
+                     min_drop_pct: float = 0.05, days_cooldown: int = 7) -> bool:
+        """True se pode enviar alerta novo (nunca alertou, ou cooldown venceu, ou preço caiu +5%)."""
+        last_at = product.get('last_alerted_at')
+        if not last_at:
+            return True
+        if datetime.now() - last_at > timedelta(days=days_cooldown):
+            return True
+        last_price = product.get('last_alerted_price')
+        if last_price and current_price < last_price * (1 - min_drop_pct):
+            return True
+        return False
+
+    def mark_alerted(self, product_id: ObjectId, price: float, percent_off: int, reason: str):
+        if self.db is None:
+            return
+        try:
+            self.db.products.update_one(
+                {'_id': product_id},
+                {'$set': {
+                    'last_alerted_at': datetime.now(),
+                    'last_alerted_price': price,
+                    'last_alerted_percent_off': percent_off,
+                    'last_alerted_reason': reason,
+                }}
+            )
+        except Exception as e:
+            logger.error(f"Erro mark_alerted: {e}")
+
+    def get_recently_alerted(self, hours: int = 24) -> List[dict]:
+        if self.db is None:
+            return []
+        try:
+            cutoff = datetime.now() - timedelta(hours=hours)
+            return list(self.db.products.find({'last_alerted_at': {'$gte': cutoff}}))
+        except Exception as e:
+            logger.error(f"Erro get_recently_alerted: {e}")
+            return []
+
     def log_click(self, user_id: int, product_id, marketplace: str):
         if self.db is None:
             return
@@ -268,17 +317,22 @@ def _random_headers() -> dict:
 
 
 def _http_get(url: str, tries: int = 3, timeout: int = 15) -> Optional[requests.Response]:
-    """GET com retry, headers rotativos e delay."""
+    """GET com retry, headers rotativos e delay. Loga status HTTP quando falha."""
+    last_status = None
+    last_error = None
     for attempt in range(tries):
         try:
             resp = requests.get(url, headers=_random_headers(), timeout=timeout)
             if resp.status_code == 200:
                 return resp
-            logger.debug(f"HTTP {resp.status_code} em {url} (tentativa {attempt + 1})")
+            last_status = resp.status_code
+            logger.warning(f"⚠️ HTTP {resp.status_code} em {url} (tentativa {attempt + 1}/{tries})")
         except requests.RequestException as e:
-            logger.debug(f"Erro request {url}: {e}")
-        # backoff exponencial
+            last_error = str(e)
+            logger.warning(f"⚠️ Erro request em {url}: {e} (tentativa {attempt + 1}/{tries})")
         asyncio_safe_sleep(2 ** attempt + random.random())
+    reason = f"status {last_status}" if last_status else f"erro {last_error}"
+    logger.warning(f"❌ _http_get desistiu de {url} após {tries} tentativas ({reason})")
     return None
 
 
@@ -610,7 +664,7 @@ O bot descobre sozinho os produtos mais populares do Brasil e te avisa quando es
 /stats - Estatísticas
 /help - Ajuda
 
-Você vai receber alertas automáticos às 08h, 12h e 18h quando o bot detectar boas ofertas.
+Você vai receber alertas <b>em tempo real</b> assim que o bot detectar uma boa oferta, e um resumo top 10 do dia todo dia às <b>20h</b>.
     """
     await update.message.reply_text(welcome_text, parse_mode='HTML')
 
@@ -622,8 +676,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 1️⃣ <b>DESCOBERTA</b>
 O bot puxa 1x/dia os produtos mais vendidos da Amazon BR (várias categorias).
 
-2️⃣ <b>MONITORAMENTO</b>
-De 6h em 6h ele checa o preço atual de cada produto e salva no histórico.
+2️⃣ <b>MONITORAMENTO CONTÍNUO</b>
+Mercado Livre a cada 15min, Amazon a cada 1h — checa preço, salva no histórico e alerta na hora.
 
 3️⃣ <b>DETECÇÃO DE DESCONTO</b>
 Considera desconto quando o preço cai 15%+ em relação a:
@@ -631,8 +685,11 @@ Considera desconto quando o preço cai 15%+ em relação a:
 - Preço "de/por" original
 - Mínimo histórico
 
-4️⃣ <b>ALERTAS</b>
-Às 08h, 12h e 18h você recebe uma mensagem agrupada com todos os produtos em oferta.
+4️⃣ <b>ALERTAS EM TEMPO REAL</b>
+Assim que detecta desconto, manda a oferta direto pra você (com foto). Sem spam: cooldown de 7 dias por produto, só realerta se o preço cair mais 5%.
+
+5️⃣ <b>RESUMO DIÁRIO</b>
+Todo dia às 20h, top 10 das melhores ofertas das últimas 24h.
 
 <b>Dúvidas?</b> É só mandar mensagem.
     """
@@ -687,16 +744,22 @@ async def force_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Seed concluído. Confere com /list_products.")
 
 
-async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Rodando check de preços agora (pode demorar alguns minutos)...")
-    await check_prices_task(context)
-    await update.message.reply_text("✅ Check concluído.")
+async def force_check_ml(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🟡 Rodando check ML agora (alerta na hora se achar desconto)...")
+    await check_ml_task(context)
+    await update.message.reply_text("✅ Check ML concluído.")
 
 
-async def force_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📢 Rodando envio de alertas agora...")
-    await send_daily_alerts(context)
-    await update.message.reply_text("✅ Alertas processados.")
+async def force_check_amazon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🟠 Rodando check Amazon agora (pode demorar alguns min)...")
+    await check_amazon_task(context)
+    await update.message.reply_text("✅ Check Amazon concluído.")
+
+
+async def force_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏆 Enviando resumo top 10 do dia...")
+    await send_daily_top_10(context)
+    await update.message.reply_text("✅ Resumo enviado.")
 
 
 # --- /add_product mantido como admin (útil pra testar / adicionar produtos fora do bestseller) ---
@@ -834,34 +897,103 @@ async def seed_bestsellers_task(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"🌱 Seed concluído — {added} produtos processados (Amazon {len(amazon_products)} + ML {len(ml_products)})")
 
 
-async def check_prices_task(context: ContextTypes.DEFAULT_TYPE):
-    """A cada 6h: busca preço atual de cada produto ativo e grava no histórico."""
-    logger.info("🔍 Iniciando check de preços...")
-    products = db.get_active_products()
-    logger.info(f"🔍 {len(products)} produtos pra checar")
+async def _check_and_alert_product(context: ContextTypes.DEFAULT_TYPE, product: dict) -> Optional[dict]:
+    """Checa preço de 1 produto, salva no histórico, e se for desconto novo envia alerta na hora.
+    Retorna dict {name, percent_off} se alertou, senão None."""
+    try:
+        data = await asyncio.to_thread(price_scraper.get_price, product)
+        if not data:
+            return None
+        db.add_price_history(
+            product['_id'],
+            data['marketplace'],
+            data['price'],
+            data.get('list_price'),
+            data.get('image_url'),
+        )
+        history = db.get_price_history(product['_id'], days=30)
+        # Reintroduz list_price no produto pro detector considerar (add_price_history atualizou o doc)
+        product = {**product, 'list_price': data.get('list_price') or product.get('list_price')}
+        is_disc, reason, percent_off = detector.check(product, data['price'], history)
+        if not is_disc:
+            return None
+        if not db.should_alert(product, data['price']):
+            logger.info(f"⏭️ Skip alerta (dedupe): {product['name'][:60]}")
+            return None
+        await _send_discount_alert(context, product, data, reason, percent_off)
+        db.mark_alerted(product['_id'], data['price'], percent_off, reason)
+        return {'name': product['name'], 'percent_off': percent_off}
+    except Exception as e:
+        logger.error(f"Erro _check_and_alert_product {product.get('name')}: {e}")
+        return None
 
-    checked = 0
-    for product in products:
+
+async def _send_discount_alert(context: ContextTypes.DEFAULT_TYPE, product: dict, data: dict,
+                                reason: str, percent_off: int):
+    """Envia alerta individual (com foto se tiver) pra todos usuários ativos."""
+    price = data['price']
+    list_price = data.get('list_price') or product.get('list_price')
+    image_url = data.get('image_url') or product.get('image_url')
+    marketplace = data.get('marketplace', product.get('marketplace', 'amazon'))
+    affiliate_url = _build_affiliate_url(product['url'], marketplace)
+    emoji = _marketplace_emoji(marketplace)
+    marketplace_name = {'amazon': 'Amazon', 'mercadolivre': 'Mercado Livre', 'shopee': 'Shopee'}.get(marketplace, 'Loja')
+
+    if list_price and list_price > price:
+        price_block = f"De <s>R$ {list_price:.2f}</s> | Por <b>R$ {price:.2f}</b> 💰"
+    else:
+        price_block = f"<b>R$ {price:.2f}</b> 💰"
+
+    caption = (
+        f"{emoji} <b>{product['name'][:100]}</b>\n\n"
+        f"{price_block}\n"
+        f"🔻 <b>{percent_off}% OFF</b> <i>({reason})</i>\n\n"
+        f"🛒 Achado na {marketplace_name}\n"
+        f"👉 <a href=\"{affiliate_url}\">Ver oferta</a>"
+    )
+
+    user_ids = db.get_all_active_user_ids()
+    for user_id in user_ids:
         try:
-            data = await asyncio.to_thread(price_scraper.get_price, product)
-            if data:
-                db.add_price_history(
-                    product['_id'],
-                    data['marketplace'],
-                    data['price'],
-                    data.get('list_price'),
-                    data.get('image_url'),
-                )
-                checked += 1
-            # ML é API — pode ser mais rápido; Amazon precisa delay maior
-            if product.get('marketplace') == 'amazon':
-                await asyncio.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
+            if image_url:
+                await context.bot.send_photo(chat_id=user_id, photo=image_url,
+                                             caption=caption, parse_mode='HTML')
             else:
-                await asyncio.sleep(random.uniform(0.3, 0.8))
+                await context.bot.send_message(chat_id=user_id, text=caption,
+                                               parse_mode='HTML', disable_web_page_preview=False)
         except Exception as e:
-            logger.error(f"Erro ao checar {product.get('name')}: {e}")
+            err = str(e).lower()
+            logger.warning(f"Falha ao alertar {user_id}: {e}")
+            if 'blocked' in err or 'forbidden' in err:
+                db.deactivate_user(user_id)
 
-    logger.info(f"🔍 Check concluído — {checked}/{len(products)} preços coletados")
+
+async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
+    """A cada 15min: checa produtos ML e alerta na hora quando acha desconto."""
+    products = db.get_products_by_marketplace('mercadolivre')
+    logger.info(f"🟡 ML check — {len(products)} produtos")
+    alerted = 0
+    for product in products:
+        result = await _check_and_alert_product(context, product)
+        if result:
+            alerted += 1
+            logger.info(f"✅ Alerta ML: {result['name'][:60]} (-{result['percent_off']}%)")
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+    logger.info(f"🟡 ML check concluído — {alerted} alertas enviados")
+
+
+async def check_amazon_task(context: ContextTypes.DEFAULT_TYPE):
+    """A cada 1h: checa produtos Amazon (mais devagar por causa do anti-bot) e alerta item-por-item."""
+    products = db.get_products_by_marketplace('amazon')
+    logger.info(f"🟠 Amazon check — {len(products)} produtos")
+    alerted = 0
+    for product in products:
+        result = await _check_and_alert_product(context, product)
+        if result:
+            alerted += 1
+            logger.info(f"✅ Alerta Amazon: {result['name'][:60]} (-{result['percent_off']}%)")
+        await asyncio.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
+    logger.info(f"🟠 Amazon check concluído — {alerted} alertas enviados")
 
 
 def _build_affiliate_url(url: str, marketplace: str = 'amazon') -> str:
@@ -878,109 +1010,47 @@ def _marketplace_emoji(marketplace: str) -> str:
     return {'amazon': '🟠', 'mercadolivre': '🟡', 'shopee': '🔴'}.get(marketplace, '🛒')
 
 
-async def send_daily_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """3x/dia: envia mensagem agrupada com todos os descontos detectados."""
-    logger.info("📢 Rodando envio de alertas...")
-
-    products = db.get_active_products()
-    discounts = []
-
-    for p in products:
-        current = p.get('current_price')
-        if not current:
-            continue
-        history = db.get_price_history(p['_id'], days=30)
-        is_disc, reason, percent_off = detector.check(p, current, history)
-        if is_disc:
-            # Preço "de" pra mostrar: prefere list_price, senão média histórica
-            list_price = p.get('list_price')
-            if not list_price and history:
-                list_price = round(statistics.mean(history), 2)
-            discounts.append({
-                'name': p['name'],
-                'price': current,
-                'list_price': list_price,
-                'url': p['url'],
-                'image_url': p.get('image_url'),
-                'reason': reason,
-                'percent_off': percent_off,
-                'category': p.get('category', ''),
-                'marketplace': p.get('marketplace', 'amazon'),
-            })
-
-    if not discounts:
-        logger.info("📢 Nenhum desconto detectado, alerta pulado")
+async def send_daily_top_10(context: ContextTypes.DEFAULT_TYPE):
+    """1x/dia às 20h: manda resumo com top 10 descontos das últimas 24h (dos produtos já alertados)."""
+    logger.info("🏆 Rodando resumo diário top 10...")
+    products = db.get_recently_alerted(hours=24)
+    if not products:
+        logger.info("🏆 Sem descontos nas últimas 24h, resumo pulado")
         return
 
-    # Ordena por maior queda
-    discounts.sort(key=lambda d: d['percent_off'] or 0, reverse=True)
+    products.sort(key=lambda p: p.get('last_alerted_percent_off', 0) or 0, reverse=True)
+    top = products[:10]
 
-    # Monta a msg agrupada (top 15 em lista)
-    lines = [f"🔥 <b>{len(discounts)} descontos detectados agora</b>\n"]
-    for i, d in enumerate(discounts[:15], 1):
-        affiliate_url = _build_affiliate_url(d['url'], d['marketplace'])
-        emoji = _marketplace_emoji(d['marketplace'])
-        if d.get('list_price') and d['list_price'] > d['price']:
-            price_line = f"   💰 De <s>R$ {d['list_price']:.2f}</s> | Por <b>R$ {d['price']:.2f}</b> (-{d['percent_off']}%)"
+    lines = [f"🏆 <b>TOP {len(top)} DO DIA</b>",
+             "<i>Melhores descontos das últimas 24h</i>\n"]
+    for i, p in enumerate(top, 1):
+        price = p.get('last_alerted_price') or p.get('current_price', 0)
+        percent = p.get('last_alerted_percent_off', 0)
+        marketplace = p.get('marketplace', 'amazon')
+        emoji = _marketplace_emoji(marketplace)
+        affiliate_url = _build_affiliate_url(p['url'], marketplace)
+        list_price = p.get('list_price')
+        if list_price and list_price > price:
+            price_line = f"   💰 De <s>R$ {list_price:.2f}</s> | Por <b>R$ {price:.2f}</b> (-{percent}%)"
         else:
-            price_line = f"   💰 <b>R$ {d['price']:.2f}</b> (-{d['percent_off']}% • {d['reason']})"
-        lines.append(f"{i}. {emoji} <b>{d['name'][:70]}</b>")
+            price_line = f"   💰 <b>R$ {price:.2f}</b> (-{percent}%)"
+        lines.append(f"{i}. {emoji} <b>{p['name'][:70]}</b>")
         lines.append(price_line)
         lines.append(f"   🛒 <a href=\"{affiliate_url}\">Ver oferta</a>\n")
-    if len(discounts) > 15:
-        lines.append(f"<i>...e mais {len(discounts) - 15} ofertas</i>")
     text = "\n".join(lines)
-
-    # Top 3 do dia pra virar msg individual com foto
-    top_three = [d for d in discounts[:3] if d.get('image_url')]
 
     user_ids = db.get_all_active_user_ids()
     sent = 0
     for user_id in user_ids:
         try:
-            # Msg 1: lista agrupada
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode='HTML',
-                disable_web_page_preview=True,
-            )
-            # Msgs 2-4: top 3 com foto individual
-            for d in top_three:
-                caption = _format_photo_caption(d)
-                try:
-                    await context.bot.send_photo(
-                        chat_id=user_id,
-                        photo=d['image_url'],
-                        caption=caption,
-                        parse_mode='HTML',
-                    )
-                except Exception as e:
-                    logger.warning(f"Falha ao enviar foto pra {user_id}: {e}")
+            await context.bot.send_message(chat_id=user_id, text=text,
+                                           parse_mode='HTML', disable_web_page_preview=True)
             sent += 1
         except Exception as e:
-            logger.warning(f"Falha ao enviar pra {user_id}: {e}")
+            logger.warning(f"Falha resumo pra {user_id}: {e}")
             if 'blocked' in str(e).lower() or 'forbidden' in str(e).lower():
                 db.deactivate_user(user_id)
-
-    logger.info(f"📢 Alertas enviados: {sent}/{len(user_ids)}")
-
-
-def _format_photo_caption(d: dict) -> str:
-    affiliate_url = _build_affiliate_url(d['url'], d['marketplace'])
-    emoji = _marketplace_emoji(d['marketplace'])
-    marketplace_name = {'amazon': 'Amazon', 'mercadolivre': 'Mercado Livre'}.get(d['marketplace'], 'Loja')
-    if d.get('list_price') and d['list_price'] > d['price']:
-        price_block = f"De <s>R$ {d['list_price']:.2f}</s> | Por <b>R$ {d['price']:.2f}</b> 💰"
-    else:
-        price_block = f"<b>R$ {d['price']:.2f}</b> 💰"
-    return (
-        f"{emoji} <b>{d['name'][:100]}</b>\n\n"
-        f"{price_block}\n"
-        f"🔻 <b>{d['percent_off']}% OFF</b>\n\n"
-        f"🛒 Achado na {marketplace_name}\n"
-        f"👉 <a href=\"{affiliate_url}\">Ver oferta</a>"
-    )
+    logger.info(f"🏆 Resumo diário enviado: {sent}/{len(user_ids)}")
 
 
 # ==================== MAIN ====================
@@ -992,8 +1062,9 @@ def main():
     app.add_handler(CommandHandler("list_products", list_products))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("force_seed", force_seed))
-    app.add_handler(CommandHandler("force_check", force_check))
-    app.add_handler(CommandHandler("force_alerts", force_alerts))
+    app.add_handler(CommandHandler("force_check_ml", force_check_ml))
+    app.add_handler(CommandHandler("force_check_amazon", force_check_amazon))
+    app.add_handler(CommandHandler("force_top10", force_top10))
 
     add_product_handler = ConversationHandler(
         entry_points=[CommandHandler("add_product", add_product_start)],
@@ -1024,12 +1095,12 @@ def main():
     job_queue = app.job_queue
     # Seed inicial 30s depois de subir + 1x/dia (a cada 24h)
     job_queue.run_repeating(seed_bestsellers_task, interval=86400, first=30)
-    # Check de preços a cada 6h — primeira execução 3min depois de subir (dá tempo do seed)
-    job_queue.run_repeating(check_prices_task, interval=21600, first=180)
-    # Alertas às 08/12/18h
-    job_queue.run_daily(send_daily_alerts, time=datetime.strptime("08:00", "%H:%M").time())
-    job_queue.run_daily(send_daily_alerts, time=datetime.strptime("12:00", "%H:%M").time())
-    job_queue.run_daily(send_daily_alerts, time=datetime.strptime("18:00", "%H:%M").time())
+    # ML: API oficial, aguenta rodar de 15 em 15min (primeira 3min após subir)
+    job_queue.run_repeating(check_ml_task, interval=900, first=180)
+    # Amazon: scraping frágil, 1 em 1h (primeira 5min após subir, escalonado do ML)
+    job_queue.run_repeating(check_amazon_task, interval=3600, first=300)
+    # Resumo diário top 10 às 20h
+    job_queue.run_daily(send_daily_top_10, time=datetime.strptime("20:00", "%H:%M").time())
 
     logger.info("🚀 Bot iniciado com sucesso!")
     app.run_polling()
