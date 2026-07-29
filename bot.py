@@ -623,27 +623,40 @@ class PriceScraper:
 
         soup = BeautifulSoup(resp.content, 'html.parser')
 
-        # Preço atual — tenta seletores em cascata
+        # Isola o container do preco PRINCIPAL (evita widgets tipo "preco melhor
+        # encontrado", "cashback", "1a compra", que sao promos condicionais e
+        # nao refletem o preco de checkout de verdade).
+        price_root = (
+            soup.select_one('#corePriceDisplay_desktop_feature_div')
+            or soup.select_one('#corePrice_feature_div')
+            or soup.select_one('#apex_desktop')
+            or soup.select_one('#apex_desktop_newAccordionRow')
+            or soup
+        )
+
+        # Preco atual — busca DENTRO do price_root apenas
         price = None
         for selector in [
+            'span.a-price[data-a-color="base"] span.a-offscreen',
+            'span.a-price[data-a-color="price"] span.a-offscreen',
+            'span.priceToPay span.a-offscreen',
+            'span.a-price:not(.a-text-price) span.a-offscreen',
             'span.a-price-whole',
-            'span.a-offscreen',
-            'span[data-a-color="price"] span.a-offscreen',
         ]:
-            el = soup.select_one(selector)
+            el = price_root.select_one(selector)
             if el:
                 price = _parse_price(el.get_text())
                 if price:
                     break
 
-        # Preço "de/por" (list price, riscado)
+        # Preco "de/por" (list price, riscado) — tambem dentro do price_root
         list_price = None
         for selector in [
+            'span.a-price.a-text-price[data-a-strike="true"] span.a-offscreen',
             'span.a-price.a-text-price span.a-offscreen',
-            'span[data-a-strike="true"] span.a-offscreen',
             '.basisPrice .a-offscreen',
         ]:
-            el = soup.select_one(selector)
+            el = price_root.select_one(selector)
             if el:
                 list_price = _parse_price(el.get_text())
                 if list_price and list_price > (price or 0):
