@@ -342,6 +342,22 @@ def asyncio_safe_sleep(seconds: float):
     time.sleep(seconds)
 
 
+import re as _re
+
+_AMAZON_ASIN_RE = _re.compile(r'/(?:dp|gp/product)/([A-Z0-9]{10})')
+
+
+def _normalize_amazon_url(href: str) -> Optional[str]:
+    """Extrai o ASIN e reconstroi URL canonica: https://www.amazon.com.br/dp/ASIN.
+    Evita duplicatas quando a Amazon devolve variantes (/ref=..., /gp/product/, com categoria no path)."""
+    if not href:
+        return None
+    m = _AMAZON_ASIN_RE.search(href)
+    if not m:
+        return None
+    return f"https://www.amazon.com.br/dp/{m.group(1)}"
+
+
 def _parse_price(text: str) -> Optional[float]:
     """Extrai float de string tipo 'R$ 1.299,90' ou '1.299,90'."""
     if not text:
@@ -459,11 +475,9 @@ class BestSellersScraper:
                 continue
 
             href = link_el.get('href', '')
-            # Normaliza URL absoluta e remove querystring
-            if href.startswith('/'):
-                product_url = f"https://www.amazon.com.br{href.split('?')[0]}"
-            else:
-                product_url = href.split('?')[0]
+            product_url = _normalize_amazon_url(href)
+            if not product_url:
+                continue
 
             # Nome — tenta em cascata: aria-label, alt de img, seletores de texto
             name = link_el.get('aria-label') or link_el.get('title')
