@@ -264,13 +264,26 @@ class Database:
     def should_alert(self, product: dict, current_price: float,
                      min_drop_pct: float = 0.10, days_cooldown: int = 7,
                      min_hours_between: int = 24) -> bool:
-        """True se pode enviar alerta novo. Regras:
+        """True se pode enviar alerta novo. Le last_alerted_at FRESCO do DB pra evitar race
+        condition entre execucoes paralelas (ex: dois check_amazon_task simultaneos).
+
+        Regras:
         - nunca alertou → alerta
-        - dentro de min_hours_between (24h) desde último alerta → NUNCA realerta (evita spam por oscilação)
-        - passou days_cooldown (7 dias) → pode realertar mesmo com mesmo preço
-        - entre 24h e 7 dias → só realerta se preço caiu +10% desde último alerta
+        - dentro de min_hours_between (24h) desde ultimo alerta → NUNCA realerta
+        - passou days_cooldown (7 dias) → pode realertar mesmo com mesmo preco
+        - entre 24h e 7 dias → so realerta se preco caiu +10% desde ultimo alerta
         """
-        last_at = product.get('last_alerted_at')
+        if self.db is None:
+            return True
+        try:
+            doc = self.db.products.find_one(
+                {'_id': product['_id']},
+                {'last_alerted_at': 1, 'last_alerted_price': 1}
+            ) or {}
+        except Exception as e:
+            logger.error(f"Erro should_alert (fresh read): {e}")
+            doc = product  # fallback pro dict cached
+        last_at = doc.get('last_alerted_at')
         if not last_at:
             return True
         hours_since = (datetime.now() - last_at).total_seconds() / 3600
@@ -278,7 +291,7 @@ class Database:
             return False
         if hours_since > days_cooldown * 24:
             return True
-        last_price = product.get('last_alerted_price')
+        last_price = doc.get('last_alerted_price')
         if last_price and current_price < last_price * (1 - min_drop_pct):
             return True
         return False
@@ -1012,8 +1025,20 @@ async def _send_discount_alert(context: ContextTypes.DEFAULT_TYPE, product: dict
                 db.deactivate_user(target)
 
 
+_ml_check_lock = asyncio.Lock()
+_amazon_check_lock = asyncio.Lock()
+
+
 async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
     """A cada 15min: checa produtos ML e alerta na hora quando acha desconto."""
+    if _ml_check_lock.locked():
+        logger.warning("🟡 check_ml_task ja rodando — pulando execucao paralela")
+        return
+    async with _ml_check_lock:
+        await _check_ml_impl(context)
+
+
+async def _check_ml_impl(context: ContextTypes.DEFAULT_TYPE):
     products = db.get_products_by_marketplace('mercadolivre')
     logger.info(f"🟡 ML check — {len(products)} produtos")
     alerted = 0
@@ -1028,6 +1053,14 @@ async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_amazon_task(context: ContextTypes.DEFAULT_TYPE):
     """A cada 1h: checa produtos Amazon (mais devagar por causa do anti-bot) e alerta item-por-item."""
+    if _amazon_check_lock.locked():
+        logger.warning("🟠 check_amazon_task ja rodando — pulando execucao paralela")
+        return
+    async with _amazon_check_lock:
+        await _check_amazon_impl(context)
+
+
+async def _check_amazon_impl(context: ContextTypes.DEFAULT_TYPE):
     products = db.get_products_by_marketplace('amazon')
     logger.info(f"🟠 Amazon check — {len(products)} produtos")
     alerted = 0
