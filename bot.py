@@ -259,12 +259,21 @@ class Database:
             return []
 
     def should_alert(self, product: dict, current_price: float,
-                     min_drop_pct: float = 0.05, days_cooldown: int = 7) -> bool:
-        """True se pode enviar alerta novo (nunca alertou, ou cooldown venceu, ou preço caiu +5%)."""
+                     min_drop_pct: float = 0.10, days_cooldown: int = 7,
+                     min_hours_between: int = 24) -> bool:
+        """True se pode enviar alerta novo. Regras:
+        - nunca alertou → alerta
+        - dentro de min_hours_between (24h) desde último alerta → NUNCA realerta (evita spam por oscilação)
+        - passou days_cooldown (7 dias) → pode realertar mesmo com mesmo preço
+        - entre 24h e 7 dias → só realerta se preço caiu +10% desde último alerta
+        """
         last_at = product.get('last_alerted_at')
         if not last_at:
             return True
-        if datetime.now() - last_at > timedelta(days=days_cooldown):
+        hours_since = (datetime.now() - last_at).total_seconds() / 3600
+        if hours_since < min_hours_between:
+            return False
+        if hours_since > days_cooldown * 24:
             return True
         last_price = product.get('last_alerted_price')
         if last_price and current_price < last_price * (1 - min_drop_pct):
@@ -717,7 +726,7 @@ Considera desconto quando o preço cai 15%+ em relação a:
 - Mínimo histórico
 
 4️⃣ <b>ALERTAS EM TEMPO REAL</b>
-Assim que detecta desconto, manda a oferta direto pra você (com foto). Sem spam: cooldown de 7 dias por produto, só realerta se o preço cair mais 5%.
+Assim que detecta desconto, manda a oferta direto pra você (com foto). Sem spam: cooldown mínimo de 24h por produto; só realerta antes de 7 dias se o preço cair mais 10%.
 
 5️⃣ <b>RESUMO DIÁRIO</b>
 Todo dia às 20h, top 10 das melhores ofertas das últimas 24h.
