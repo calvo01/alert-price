@@ -36,3 +36,7 @@ Thumbs.db
 # MongoDB dumps locais
 dump/
 *.bson
+
+# Docs internos (roadmap, notas privadas, ideias) — NÃO subir pro GitHub
+*_INTERNAL.md
+INTERNAL/
