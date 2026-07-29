@@ -25,6 +25,9 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017/price_alert_bot")
 AWS_ASSOCIATE_TAG = os.getenv("AMAZON_ASSOCIATE_TAG", "")
+# CHANNEL_ID pode ser @username (ex: '@achadosmlsp') ou chat_id numerico ('-1001234567890').
+# Se setado, o bot posta APENAS no canal (ignora users individuais). Se vazio, itera users que deram /start.
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip() or None
 
 # Config do detector de desconto
 DISCOUNT_THRESHOLD = 0.85       # preço atual < 85% da referência = desconto (queda de 15%+)
@@ -992,20 +995,21 @@ async def _send_discount_alert(context: ContextTypes.DEFAULT_TYPE, product: dict
         f"👉 <a href=\"{affiliate_url}\">Ver oferta</a>"
     )
 
-    user_ids = db.get_all_active_user_ids()
-    for user_id in user_ids:
+    # Se CHANNEL_ID setado, posta so no canal (broadcast). Senao, itera users individuais.
+    targets = [CHANNEL_ID] if CHANNEL_ID else db.get_all_active_user_ids()
+    for target in targets:
         try:
             if image_url:
-                await context.bot.send_photo(chat_id=user_id, photo=image_url,
+                await context.bot.send_photo(chat_id=target, photo=image_url,
                                              caption=caption, parse_mode='HTML')
             else:
-                await context.bot.send_message(chat_id=user_id, text=caption,
+                await context.bot.send_message(chat_id=target, text=caption,
                                                parse_mode='HTML', disable_web_page_preview=False)
         except Exception as e:
             err = str(e).lower()
-            logger.warning(f"Falha ao alertar {user_id}: {e}")
-            if 'blocked' in err or 'forbidden' in err:
-                db.deactivate_user(user_id)
+            logger.warning(f"Falha ao alertar {target}: {e}")
+            if isinstance(target, int) and ('blocked' in err or 'forbidden' in err):
+                db.deactivate_user(target)
 
 
 async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
@@ -1079,18 +1083,18 @@ async def send_daily_top_10(context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   🛒 <a href=\"{affiliate_url}\">Ver oferta</a>\n")
     text = "\n".join(lines)
 
-    user_ids = db.get_all_active_user_ids()
+    targets = [CHANNEL_ID] if CHANNEL_ID else db.get_all_active_user_ids()
     sent = 0
-    for user_id in user_ids:
+    for target in targets:
         try:
-            await context.bot.send_message(chat_id=user_id, text=text,
+            await context.bot.send_message(chat_id=target, text=text,
                                            parse_mode='HTML', disable_web_page_preview=True)
             sent += 1
         except Exception as e:
-            logger.warning(f"Falha resumo pra {user_id}: {e}")
-            if 'blocked' in str(e).lower() or 'forbidden' in str(e).lower():
-                db.deactivate_user(user_id)
-    logger.info(f"🏆 Resumo diário enviado: {sent}/{len(user_ids)}")
+            logger.warning(f"Falha resumo pra {target}: {e}")
+            if isinstance(target, int) and ('blocked' in str(e).lower() or 'forbidden' in str(e).lower()):
+                db.deactivate_user(target)
+    logger.info(f"🏆 Resumo diário enviado: {sent}/{len(targets)}")
 
 
 # ==================== MAIN ====================
