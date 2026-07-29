@@ -54,10 +54,14 @@ MERCADOLIVRE_CATEGORIES = {
 MERCADOLIVRE_AFFILIATE_TAG = os.getenv("MERCADOLIVRE_AFFILIATE_TAG", "")
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:132.0) Gecko/20100101 Firefox/132.0",
 ]
 
 logging.basicConfig(
@@ -308,12 +312,25 @@ class Database:
 
 
 # ==================== SCRAPING ====================
-def _random_headers() -> dict:
-    return {
+def _random_headers(url: str = "") -> dict:
+    """Headers rotativos que imitam browser real. Adiciona Referer contextual quando aplicavel."""
+    h = {
         'User-Agent': random.choice(USER_AGENTS),
-        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
     }
+    if 'amazon.com.br' in url:
+        h['Referer'] = 'https://www.amazon.com.br/'
+    elif 'mercadolivre' in url or 'mercadolibre' in url:
+        h['Referer'] = 'https://www.mercadolivre.com.br/'
+    return h
 
 
 def _http_get(url: str, tries: int = 3, timeout: int = 15) -> Optional[requests.Response]:
@@ -322,7 +339,7 @@ def _http_get(url: str, tries: int = 3, timeout: int = 15) -> Optional[requests.
     last_error = None
     for attempt in range(tries):
         try:
-            resp = requests.get(url, headers=_random_headers(), timeout=timeout)
+            resp = requests.get(url, headers=_random_headers(url), timeout=timeout)
             if resp.status_code == 200:
                 return resp
             last_status = resp.status_code
