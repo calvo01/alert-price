@@ -55,6 +55,8 @@ MERCADOLIVRE_CATEGORIES = {
     'MLB1276': 'esportes',
 }
 MERCADOLIVRE_AFFILIATE_TAG = os.getenv("MERCADOLIVRE_AFFILIATE_TAG", "")
+MERCADOLIVRE_CLIENT_ID = os.getenv("MERCADOLIVRE_CLIENT_ID", "")
+MERCADOLIVRE_CLIENT_SECRET = os.getenv("MERCADOLIVRE_CLIENT_SECRET", "")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -358,6 +360,85 @@ def _random_headers(url: str = "") -> dict:
     return h
 
 
+_ml_token_cache = {'token': None, 'expires_at': None}
+
+
+def _get_ml_token() -> Optional[str]:
+    """Devolve access_token OAuth2 do ML, renovando quando faltar <10min pro vencimento."""
+    if not MERCADOLIVRE_CLIENT_ID or not MERCADOLIVRE_CLIENT_SECRET:
+        logger.warning("⚠️ MERCADOLIVRE_CLIENT_ID/SECRET não configurados — pulando ML")
+        return None
+
+    now = datetime.now()
+    cached = _ml_token_cache['token']
+    expires_at = _ml_token_cache['expires_at']
+    if cached and expires_at and (expires_at - now).total_seconds() > 600:
+        return cached
+
+    try:
+        resp = requests.post(
+            'https://api.mercadolibre.com/oauth/token',
+            data={
+                'grant_type': 'client_credentials',
+                'client_id': MERCADOLIVRE_CLIENT_ID,
+                'client_secret': MERCADOLIVRE_CLIENT_SECRET,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        logger.error(f"❌ Erro ao pegar token ML: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.error(f"❌ Token ML falhou: HTTP {resp.status_code} — {resp.text[:200]}")
+        return None
+
+    data = resp.json()
+    token = data.get('access_token')
+    expires_in = data.get('expires_in', 21600)
+    if not token:
+        return None
+
+    _ml_token_cache['token'] = token
+    _ml_token_cache['expires_at'] = now + timedelta(seconds=expires_in)
+    logger.info(f"🔑 Token ML renovado (expira em {expires_in}s)")
+    return token
+
+
+def _http_get_ml(url: str, tries: int = 3, timeout: int = 15) -> Optional[requests.Response]:
+    """GET autenticado na API do ML. Renova token em caso de 401."""
+    token = _get_ml_token()
+    if not token:
+        return None
+
+    for attempt in range(tries):
+        try:
+            resp = requests.get(
+                url,
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning(f"⚠️ Erro request ML {url}: {e} (tentativa {attempt + 1}/{tries})")
+            asyncio_safe_sleep(2 ** attempt + random.random())
+            continue
+
+        if resp.status_code == 200:
+            return resp
+        if resp.status_code == 401 and attempt == 0:
+            logger.info("🔄 Token ML expirado (401) — renovando e tentando de novo")
+            _ml_token_cache['token'] = None
+            token = _get_ml_token()
+            if not token:
+                return None
+            continue
+        logger.warning(f"⚠️ HTTP {resp.status_code} em {url} (tentativa {attempt + 1}/{tries})")
+        asyncio_safe_sleep(2 ** attempt + random.random())
+
+    logger.warning(f"❌ _http_get_ml desistiu de {url} após {tries} tentativas")
+    return None
+
+
 def _http_get(url: str, tries: int = 3, timeout: int = 15) -> Optional[requests.Response]:
     """GET com retry, headers rotativos e delay. Loga status HTTP quando falha."""
     last_status = None
@@ -448,7 +529,7 @@ class BestSellersScraper:
 
     def _fetch_ml_category(self, category_id: str, category_name: str, limit: int) -> List[dict]:
         url = f"https://api.mercadolibre.com/sites/MLB/search?category={category_id}&sort=sold_quantity_desc&limit={limit}&condition=new"
-        resp = _http_get(url)
+        resp = _http_get_ml(url)
         if not resp:
             logger.warning(f"❌ Falha API ML: {category_name}")
             return []
@@ -586,7 +667,7 @@ class PriceScraper:
             return None
 
         url = f"https://api.mercadolibre.com/items/{item_id}"
-        resp = _http_get(url)
+        resp = _http_get_ml(url)
         if not resp:
             return None
         try:
