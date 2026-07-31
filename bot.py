@@ -47,6 +47,8 @@ AMAZON_BESTSELLER_URLS = [
 MERCADOLIVRE_AFFILIATE_TAG = os.getenv("MERCADOLIVRE_AFFILIATE_TAG", "")
 MERCADOLIVRE_CLIENT_ID = os.getenv("MERCADOLIVRE_CLIENT_ID", "")
 MERCADOLIVRE_CLIENT_SECRET = os.getenv("MERCADOLIVRE_CLIENT_SECRET", "")
+# Cookie de sessão do painel de afiliado (renovar quando expirar — normalmente ~30 dias)
+MERCADOLIVRE_COOKIE = os.getenv("MERCADOLIVRE_COOKIE", "")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -326,6 +328,28 @@ class Database:
             })
         except Exception as e:
             logger.error(f"Erro log_click: {e}")
+
+    # ---------- Cache shortlink ML afiliado ----------
+    def get_ml_shortlink(self, origin_url: str) -> Optional[str]:
+        if self.db is None:
+            return None
+        try:
+            doc = self.db.affiliate_shortlinks.find_one({'origin_url': origin_url})
+            return doc['short_url'] if doc else None
+        except Exception:
+            return None
+
+    def save_ml_shortlink(self, origin_url: str, short_url: str, tag: str):
+        if self.db is None:
+            return
+        try:
+            self.db.affiliate_shortlinks.update_one(
+                {'origin_url': origin_url},
+                {'$set': {'short_url': short_url, 'tag': tag, 'created_at': datetime.now()}},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.error(f"Erro save_ml_shortlink: {e}")
 
 
 # ==================== SCRAPING ====================
@@ -1165,13 +1189,78 @@ async def _check_amazon_impl(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"🟠 Amazon check concluído — {alerted} alertas enviados")
 
 
+_ml_cookie_warned_expired = False
+
+
+def _ml_affiliate_shortlink(long_url: str) -> Optional[str]:
+    """Chama API do painel de afiliado ML pra gerar meli.la/xxx. Cacheia no Mongo (links são permanentes)."""
+    global _ml_cookie_warned_expired
+    if not MERCADOLIVRE_COOKIE or not MERCADOLIVRE_AFFILIATE_TAG:
+        return None
+
+    cached = db.get_ml_shortlink(long_url)
+    if cached:
+        return cached
+
+    m = _re.search(r'_csrf=([^;]+)', MERCADOLIVRE_COOKIE)
+    if not m:
+        logger.warning("⚠️ MERCADOLIVRE_COOKIE não contém _csrf token")
+        return None
+    csrf = m.group(1)
+
+    try:
+        resp = requests.post(
+            'https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink',
+            json={'urls': [long_url], 'tag': MERCADOLIVRE_AFFILIATE_TAG},
+            headers={
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'application/json, text/plain, */*',
+                'Content-Type': 'application/json;charset=UTF-8',
+                'Cookie': MERCADOLIVRE_COOKIE,
+                'Referer': 'https://www.mercadolivre.com.br/afiliados/link-generator',
+                'Origin': 'https://www.mercadolivre.com.br',
+                'x-csrf-token': csrf,
+                'x-requested-with': 'XMLHttpRequest',
+            },
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        logger.warning(f"⚠️ Erro ao chamar ML createLink: {e}")
+        return None
+
+    if resp.status_code in (401, 403):
+        if not _ml_cookie_warned_expired:
+            logger.error(f"❌ Cookie ML expirado (HTTP {resp.status_code}) — renove MERCADOLIVRE_COOKIE no .env")
+            _ml_cookie_warned_expired = True
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"⚠️ ML createLink HTTP {resp.status_code}: {resp.text[:150]}")
+        return None
+
+    try:
+        url_obj = resp.json()['urls'][0]
+    except (KeyError, IndexError, ValueError):
+        return None
+
+    if 'short_url' not in url_obj:
+        logger.info(f"ℹ️ ML rejeitou URL ({url_obj.get('message', '?')}): {long_url[:80]}")
+        return None
+
+    short = url_obj['short_url']
+    db.save_ml_shortlink(long_url, short, MERCADOLIVRE_AFFILIATE_TAG)
+    _ml_cookie_warned_expired = False
+    return short
+
+
 def _build_affiliate_url(url: str, marketplace: str = 'amazon') -> str:
     if marketplace == 'amazon' and AWS_ASSOCIATE_TAG and 'amazon.com.br' in url:
         separator = '&' if '?' in url else '?'
         return f"{url}{separator}tag={AWS_ASSOCIATE_TAG}"
-    if marketplace == 'mercadolivre' and MERCADOLIVRE_AFFILIATE_TAG:
-        separator = '&' if '?' in url else '?'
-        return f"{url}{separator}matt_tool={MERCADOLIVRE_AFFILIATE_TAG}"
+    if marketplace == 'mercadolivre':
+        short = _ml_affiliate_shortlink(url)
+        if short:
+            return short
     return url
 
 
