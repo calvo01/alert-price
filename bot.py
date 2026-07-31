@@ -44,16 +44,6 @@ AMAZON_BESTSELLER_URLS = [
     "https://www.amazon.com.br/gp/bestsellers/sports/",
 ]
 
-# Mercado Livre: IDs de categorias oficiais (site MLB = Brasil)
-# Referência: https://api.mercadolibre.com/sites/MLB/categories
-MERCADOLIVRE_CATEGORIES = {
-    'MLB1051': 'celulares',
-    'MLB1648': 'informatica',
-    'MLB1000': 'eletronicos',
-    'MLB1574': 'casa',
-    'MLB1246': 'beleza',
-    'MLB1276': 'esportes',
-}
 MERCADOLIVRE_AFFILIATE_TAG = os.getenv("MERCADOLIVRE_AFFILIATE_TAG", "")
 MERCADOLIVRE_CLIENT_ID = os.getenv("MERCADOLIVRE_CLIENT_ID", "")
 MERCADOLIVRE_CLIENT_SECRET = os.getenv("MERCADOLIVRE_CLIENT_SECRET", "")
@@ -345,7 +335,7 @@ def _random_headers(url: str = "") -> dict:
         'User-Agent': random.choice(USER_AGENTS),
         'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Encoding': 'gzip, deflate',
         'DNT': '1',
         'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
@@ -515,49 +505,57 @@ class BestSellersScraper:
         logger.info(f"📦 Total Amazon: {len(all_products)}")
         return all_products
 
-    def get_ml_bestsellers(self, limit: int = BESTSELLERS_LIMIT) -> List[dict]:
-        """Usa API pública do ML pra pegar mais vendidos por categoria."""
-        all_products = []
-        for cat_id, cat_name in MERCADOLIVRE_CATEGORIES.items():
-            logger.info(f"🔎 Buscando bestsellers ML: {cat_name}")
-            products = self._fetch_ml_category(cat_id, cat_name, limit)
-            all_products.extend(products)
-            import time
-            time.sleep(random.uniform(1, 2))
-        logger.info(f"📦 Total ML: {len(all_products)}")
-        return all_products
+    def get_ml_bestsellers(self, limit: int = BESTSELLERS_LIMIT * 4) -> List[dict]:
+        """Raspa /ofertas do site do ML (API pública foi bloqueada por PolicyAgent em 2025)."""
+        return self._scrape_ml_ofertas(limit=limit)
 
-    def _fetch_ml_category(self, category_id: str, category_name: str, limit: int) -> List[dict]:
-        url = f"https://api.mercadolibre.com/sites/MLB/search?category={category_id}&sort=sold_quantity_desc&limit={limit}&condition=new"
-        resp = _http_get_ml(url)
+    def _scrape_ml_ofertas(self, limit: int) -> List[dict]:
+        url = "https://www.mercadolivre.com.br/ofertas"
+        resp = _http_get(url)
         if not resp:
-            logger.warning(f"❌ Falha API ML: {category_name}")
-            return []
-        try:
-            data = resp.json()
-        except Exception as e:
-            logger.error(f"Erro parse JSON ML {category_name}: {e}")
+            logger.warning(f"❌ Falha ao buscar {url}")
             return []
 
-        results = data.get('results', [])
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        cards = soup.select('div.poly-card')
         products = []
-        for item in results:
-            title = item.get('title')
-            permalink = item.get('permalink')
-            if not title or not permalink:
+
+        for card in cards[:limit]:
+            title_el = card.select_one('a.poly-component__title')
+            if not title_el:
                 continue
+            name = title_el.get_text(strip=True)
+            href = title_el.get('href', '')
+            if not name or not href:
+                continue
+
+            item_id = None
+            m = _re.search(r'MLB-?(\d+)', href)
+            if m:
+                item_id = f"MLB{m.group(1)}"
+
+            price_el = card.select_one('.poly-price__current .andes-money-amount__fraction')
+            price = _parse_price(price_el.get_text(strip=True)) if price_el else None
+
+            list_price_el = card.select_one('s.andes-money-amount--previous .andes-money-amount__fraction')
+            list_price = _parse_price(list_price_el.get_text(strip=True)) if list_price_el else None
+
+            img_el = card.select_one('img.poly-component__picture')
+            image_url = img_el.get('src') if img_el else None
+
             products.append({
-                'name': title[:200],
-                'url': permalink.split('?')[0],
-                'image_url': item.get('thumbnail'),
+                'name': name[:200],
+                'url': href.split('?')[0],
+                'image_url': image_url,
                 'marketplace': 'mercadolivre',
-                'category': category_name,
+                'category': 'ofertas',
                 'source': 'bestseller',
-                'ml_item_id': item.get('id'),
-                'initial_price': item.get('price'),
-                'initial_list_price': item.get('original_price'),
+                'ml_item_id': item_id,
+                'initial_price': price,
+                'initial_list_price': list_price,
             })
-        logger.info(f"📄 ML {category_name}: {len(products)} extraídos")
+
+        logger.info(f"📄 ML /ofertas: {len(cards)} cards, {len(products)} extraídos")
         return products
 
     def _scrape_amazon_category(self, url: str, category: str, limit: int) -> List[dict]:
