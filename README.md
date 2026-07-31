@@ -14,8 +14,8 @@ Projeto pessoal de estudo — foco em async, MongoDB, scraping e API do Telegram
    - Média dos últimos 30 dias
    - Preço "de/por" original
    - Mínimo histórico
-4. **Alerta em tempo real (item por item):** assim que detecta desconto, manda mensagem com foto pra todos os usuários
-5. **Dedupe anti-spam:** cooldown de 7 dias por produto (ou queda +5% pra realertar antes)
+4. **Alerta em cadência constante:** quando detecta desconto, entra na fila. Dispatcher manda **1 mensagem a cada 5min** (com foto) pra não flodar nem ficar em silêncio. Maior desconto pendente sai primeiro.
+5. **Dedupe anti-spam:** cooldown de 8h por produto (24h + queda +10% pra realertar antes)
 6. **Resumo diário 20h:** top 10 dos melhores descontos das últimas 24h
 
 ## Stack
@@ -45,6 +45,8 @@ Projeto pessoal de estudo — foco em async, MongoDB, scraping e API do Telegram
 - `/force_check_ml` — checa produtos ML agora
 - `/force_check_amazon` — checa produtos Amazon agora
 - `/force_top10` — envia resumo top 10 agora
+- `/queue` — quantos alertas estão na fila
+- `/force_dispatch` — envia 1 alerta da fila agora (pula a espera)
 
 ## Setup local
 

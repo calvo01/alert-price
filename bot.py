@@ -35,6 +35,12 @@ MIN_HISTORY_POINTS = 5          # mínimo de leituras pra usar média histórica
 BESTSELLERS_LIMIT = 20          # top N por categoria da Amazon
 SCRAPE_DELAY_RANGE = (2, 4)     # delay aleatório entre requests (segundos)
 
+# Cadência do canal: dispatcher manda 1 alerta enfileirado a cada X segundos.
+# Evita rajadas (24 msgs em 2min → silêncio o dia inteiro) e mantém canal ativo.
+ALERT_INTERVAL_SECONDS = int(os.getenv('ALERT_INTERVAL_SECONDS', '300'))
+# TTL de alerta na fila — se ficou mais que isso pendente, descarta (oferta velha)
+ALERT_QUEUE_TTL_HOURS = int(os.getenv('ALERT_QUEUE_TTL_HOURS', '12'))
+
 # Amazon: URLs de bestsellers por categoria (mais variedade que a home)
 AMAZON_BESTSELLER_URLS = [
     "https://www.amazon.com.br/gp/bestsellers/electronics/",
@@ -258,16 +264,16 @@ class Database:
             return []
 
     def should_alert(self, product: dict, current_price: float,
-                     min_drop_pct: float = 0.10, days_cooldown: int = 2,
-                     min_hours_between: int = 24) -> bool:
+                     min_drop_pct: float = 0.10, days_cooldown: int = 1,
+                     min_hours_between: int = 8) -> bool:
         """True se pode enviar alerta novo. Le last_alerted_at FRESCO do DB pra evitar race
         condition entre execucoes paralelas (ex: dois check_amazon_task simultaneos).
 
         Regras:
         - nunca alertou → alerta
-        - dentro de min_hours_between (24h) desde ultimo alerta → NUNCA realerta
-        - passou days_cooldown (2 dias) → pode realertar mesmo com mesmo preco
-        - entre 24h e 2 dias → so realerta se preco caiu +10% desde ultimo alerta
+        - dentro de min_hours_between (8h) desde ultimo alerta → NUNCA realerta
+        - passou days_cooldown (1 dia) → pode realertar mesmo com mesmo preco
+        - entre 8h e 1 dia → so realerta se preco caiu +10% desde ultimo alerta
         """
         if self.db is None:
             return True
@@ -330,6 +336,77 @@ class Database:
             })
         except Exception as e:
             logger.error(f"Erro log_click: {e}")
+
+    # ---------- Fila de alertas (dispatcher espaçado) ----------
+    def enqueue_alert(self, product_id: ObjectId, data: dict, percent_off: int, reason: str) -> bool:
+        """Marca produto como pending_alert com o snapshot do desconto. Se ja tem pending,
+        atualiza somente se o desconto novo for maior (evita perder ofertas melhores)."""
+        if self.db is None:
+            return False
+        try:
+            existing = self.db.products.find_one(
+                {'_id': product_id, 'pending_alert': True},
+                {'pending_percent_off': 1}
+            )
+            if existing and (existing.get('pending_percent_off') or 0) >= percent_off:
+                return False
+            self.db.products.update_one(
+                {'_id': product_id},
+                {'$set': {
+                    'pending_alert': True,
+                    'pending_price': data['price'],
+                    'pending_list_price': data.get('list_price'),
+                    'pending_image_url': data.get('image_url'),
+                    'pending_marketplace': data.get('marketplace'),
+                    'pending_percent_off': percent_off,
+                    'pending_reason': reason,
+                    'pending_since': datetime.now(),
+                }}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Erro enqueue_alert: {e}")
+            return False
+
+    def pop_next_pending_alert(self, max_age_hours: int = 12) -> Optional[dict]:
+        """Retorna proximo alerta da fila (maior desconto primeiro) e desmarca pending.
+        Descarta silenciosamente alertas mais velhos que max_age_hours."""
+        if self.db is None:
+            return None
+        try:
+            cutoff = datetime.now() - timedelta(hours=max_age_hours)
+            expired = self.db.products.update_many(
+                {'pending_alert': True, 'pending_since': {'$lt': cutoff}},
+                {'$set': {'pending_alert': False}}
+            )
+            if expired.modified_count:
+                logger.info(f"🗑️ Descartados {expired.modified_count} alertas velhos (>{max_age_hours}h) da fila")
+            return self.db.products.find_one_and_update(
+                {'pending_alert': True},
+                {'$set': {'pending_alert': False}},
+                sort=[('pending_percent_off', -1)],
+            )
+        except Exception as e:
+            logger.error(f"Erro pop_next_pending_alert: {e}")
+            return None
+
+    def get_pending_count(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            return self.db.products.count_documents({'pending_alert': True})
+        except Exception:
+            return 0
+
+    def has_pending_alert(self, product_id: ObjectId) -> bool:
+        if self.db is None:
+            return False
+        try:
+            return self.db.products.count_documents(
+                {'_id': product_id, 'pending_alert': True}, limit=1
+            ) > 0
+        except Exception:
+            return False
 
     # ---------- Cache shortlink ML afiliado ----------
     def get_ml_shortlink(self, origin_url: str) -> Optional[str]:
@@ -531,12 +608,29 @@ class BestSellersScraper:
         logger.info(f"📦 Total Amazon: {len(all_products)}")
         return all_products
 
-    def get_ml_bestsellers(self, limit: int = BESTSELLERS_LIMIT * 4) -> List[dict]:
-        """Raspa /ofertas do site do ML (API pública foi bloqueada por PolicyAgent em 2025)."""
-        return self._scrape_ml_ofertas(limit=limit)
+    def get_ml_bestsellers(self, limit: int = BESTSELLERS_LIMIT * 4, pages: int = 3) -> List[dict]:
+        """Raspa /ofertas do site do ML (API pública foi bloqueada por PolicyAgent em 2025).
+        Percorre `pages` páginas pra ampliar o universo (~3x mais produtos)."""
+        all_products = []
+        seen_urls = set()
+        for page in range(1, pages + 1):
+            products = self._scrape_ml_ofertas(limit=limit, page=page)
+            new = 0
+            for p in products:
+                if p['url'] in seen_urls:
+                    continue
+                seen_urls.add(p['url'])
+                all_products.append(p)
+                new += 1
+            logger.info(f"🟡 ML /ofertas página {page}: {len(products)} cards, {new} novos (total {len(all_products)})")
+            if not products:
+                break
+            import time
+            time.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
+        return all_products
 
-    def _scrape_ml_ofertas(self, limit: int) -> List[dict]:
-        url = "https://www.mercadolivre.com.br/ofertas"
+    def _scrape_ml_ofertas(self, limit: int, page: int = 1) -> List[dict]:
+        url = "https://www.mercadolivre.com.br/ofertas" if page == 1 else f"https://www.mercadolivre.com.br/ofertas?page={page}"
         resp = _http_get(url)
         if not resp:
             logger.warning(f"❌ Falha ao buscar {url}")
@@ -581,7 +675,6 @@ class BestSellersScraper:
                 'initial_list_price': list_price,
             })
 
-        logger.info(f"📄 ML /ofertas: {len(cards)} cards, {len(products)} extraídos")
         return products
 
     def _scrape_amazon_category(self, url: str, category: str, limit: int) -> List[dict]:
@@ -849,6 +942,7 @@ O bot descobre sozinho os produtos mais populares do Brasil e te avisa quando es
 /start - Reinicia
 /list_products - Ver produtos rastreados
 /stats - Estatísticas
+/queue - Alertas na fila
 /help - Ajuda
 
 Você vai receber alertas <b>em tempo real</b> assim que o bot detectar uma boa oferta, e um resumo top 10 do dia todo dia às <b>20h</b>.
@@ -872,8 +966,8 @@ Considera desconto quando o preço cai 15%+ em relação a:
 - Preço "de/por" original
 - Mínimo histórico
 
-4️⃣ <b>ALERTAS EM TEMPO REAL</b>
-Assim que detecta desconto, manda a oferta direto pra você (com foto). Sem spam: cooldown mínimo de 24h por produto; só realerta antes de 2 dias se o preço cair mais 10%.
+4️⃣ <b>ALERTAS EM CADÊNCIA CONSTANTE</b>
+Quando detecta desconto, entra na fila. O canal recebe 1 oferta a cada 5min (com foto). Sem rajadas nem silêncio: melhor desconto pendente sai primeiro. Cooldown de 8h por produto (24h + queda de 10% pra realertar).
 
 5️⃣ <b>RESUMO DIÁRIO</b>
 Todo dia às 20h, top 10 das melhores ofertas das últimas 24h.
@@ -914,6 +1008,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     products = db.get_active_products()
     users = db.get_users_count()
     with_price = sum(1 for p in products if p.get('current_price'))
+    pending = db.get_pending_count()
+    interval_min = ALERT_INTERVAL_SECONDS // 60
 
     stats_text = f"""
 📈 <b>ESTATÍSTICAS</b>
@@ -921,9 +1017,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👥 Usuários ativos: {users}
 📦 Produtos rastreados: {len(products)}
 💰 Com preço coletado: {with_price}
+📬 Fila de alertas: {pending}
 ⏰ Agora: {datetime.now().strftime('%d/%m %H:%M')}
 
-🎯 Próximos alertas: 08h, 12h, 18h
+🎯 Cadência do canal: 1 alerta a cada {interval_min} min
     """
     await update.message.reply_text(stats_text, parse_mode='HTML')
 
@@ -956,6 +1053,33 @@ async def force_top10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 Enviando resumo top 10 do dia...")
     await send_daily_top_10(context)
     await update.message.reply_text("✅ Resumo enviado.")
+
+
+async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra quantos alertas estão pendentes na fila do dispatcher."""
+    pending = db.get_pending_count()
+    interval_min = ALERT_INTERVAL_SECONDS // 60
+    if pending == 0:
+        await update.message.reply_text("📭 Fila vazia — nenhum alerta pendente.")
+        return
+    eta_min = pending * interval_min
+    await update.message.reply_text(
+        f"📬 <b>{pending}</b> alerta(s) na fila\n"
+        f"⏱️ Cadência: 1 msg a cada {interval_min} min\n"
+        f"⏳ ETA pra esvaziar: ~{eta_min} min",
+        parse_mode='HTML'
+    )
+
+
+async def force_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Força envio de 1 alerta da fila agora (útil pra testar)."""
+    pending = db.get_pending_count()
+    if pending == 0:
+        await update.message.reply_text("📭 Fila vazia.")
+        return
+    await update.message.reply_text(f"📤 Disparando 1 da fila (restam {pending})...")
+    await dispatch_pending_alerts_task(context)
+    await update.message.reply_text(f"✅ Enviado. Restam {db.get_pending_count()} na fila.")
 
 
 # --- /add_product mantido como admin (útil pra testar / adicionar produtos fora do bestseller) ---
@@ -1094,8 +1218,9 @@ async def seed_bestsellers_task(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _check_and_alert_product(context: ContextTypes.DEFAULT_TYPE, product: dict) -> Optional[dict]:
-    """Checa preço de 1 produto, salva no histórico, e se for desconto novo envia alerta na hora.
-    Retorna dict {name, percent_off} se alertou, senão None."""
+    """Checa preço de 1 produto, salva no histórico, e se for desconto novo enfileira alerta.
+    O dispatcher (dispatch_pending_alerts_task) envia da fila em cadência controlada.
+    Retorna dict {name, percent_off} se enfileirou, senão None."""
     try:
         data = await asyncio.to_thread(price_scraper.get_price, product)
         if not data:
@@ -1114,14 +1239,43 @@ async def _check_and_alert_product(context: ContextTypes.DEFAULT_TYPE, product: 
         if not is_disc:
             return None
         if not db.should_alert(product, data['price']):
-            logger.info(f"⏭️ Skip alerta (dedupe): {product['name'][:60]}")
             return None
-        await _send_discount_alert(context, product, data, reason, percent_off)
-        db.mark_alerted(product['_id'], data['price'], percent_off, reason)
-        return {'name': product['name'], 'percent_off': percent_off}
+        if db.enqueue_alert(product['_id'], data, percent_off, reason):
+            logger.info(f"➕ Enfileirado: {product['name'][:60]} (-{percent_off}%, {reason})")
+            return {'name': product['name'], 'percent_off': percent_off}
+        return None
     except Exception as e:
         logger.error(f"Erro _check_and_alert_product {product.get('name')}: {e}")
         return None
+
+
+_dispatch_lock = asyncio.Lock()
+
+
+async def dispatch_pending_alerts_task(context: ContextTypes.DEFAULT_TYPE):
+    """A cada ALERT_INTERVAL_SECONDS: puxa 1 alerta da fila (maior desconto primeiro),
+    envia e marca como alertado. Mantem cadencia constante no canal."""
+    if _dispatch_lock.locked():
+        return
+    async with _dispatch_lock:
+        product = db.pop_next_pending_alert(max_age_hours=ALERT_QUEUE_TTL_HOURS)
+        if not product:
+            return
+        data = {
+            'price': product.get('pending_price'),
+            'list_price': product.get('pending_list_price'),
+            'image_url': product.get('pending_image_url'),
+            'marketplace': product.get('pending_marketplace') or product.get('marketplace'),
+        }
+        percent_off = product.get('pending_percent_off', 0)
+        reason = product.get('pending_reason', '')
+        try:
+            await _send_discount_alert(context, product, data, reason, percent_off)
+            db.mark_alerted(product['_id'], data['price'], percent_off, reason)
+            pending = db.get_pending_count()
+            logger.info(f"📤 Alerta enviado (restam {pending} na fila): {product['name'][:60]} (-{percent_off}%)")
+        except Exception as e:
+            logger.error(f"Erro dispatch_pending_alerts_task {product.get('name')}: {e}")
 
 
 async def _send_discount_alert(context: ContextTypes.DEFAULT_TYPE, product: dict, data: dict,
@@ -1181,14 +1335,14 @@ async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
 async def _check_ml_impl(context: ContextTypes.DEFAULT_TYPE):
     products = db.get_products_by_marketplace('mercadolivre')
     logger.info(f"🟡 ML check — {len(products)} produtos")
-    alerted = 0
+    enqueued = 0
     for product in products:
         result = await _check_and_alert_product(context, product)
         if result:
-            alerted += 1
-            logger.info(f"✅ Alerta ML: {result['name'][:60]} (-{result['percent_off']}%)")
+            enqueued += 1
         await asyncio.sleep(random.uniform(0.3, 0.8))
-    logger.info(f"🟡 ML check concluído — {alerted} alertas enviados")
+    pending = db.get_pending_count()
+    logger.info(f"🟡 ML check concluído — {enqueued} novos enfileirados (fila total: {pending})")
 
 
 async def check_amazon_task(context: ContextTypes.DEFAULT_TYPE):
@@ -1203,14 +1357,14 @@ async def check_amazon_task(context: ContextTypes.DEFAULT_TYPE):
 async def _check_amazon_impl(context: ContextTypes.DEFAULT_TYPE):
     products = db.get_products_by_marketplace('amazon')
     logger.info(f"🟠 Amazon check — {len(products)} produtos")
-    alerted = 0
+    enqueued = 0
     for product in products:
         result = await _check_and_alert_product(context, product)
         if result:
-            alerted += 1
-            logger.info(f"✅ Alerta Amazon: {result['name'][:60]} (-{result['percent_off']}%)")
+            enqueued += 1
         await asyncio.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
-    logger.info(f"🟠 Amazon check concluído — {alerted} alertas enviados")
+    pending = db.get_pending_count()
+    logger.info(f"🟠 Amazon check concluído — {enqueued} novos enfileirados (fila total: {pending})")
 
 
 _ml_cookie_warned_expired = False
@@ -1367,6 +1521,8 @@ def main():
     app.add_handler(CommandHandler("force_check_ml", force_check_ml))
     app.add_handler(CommandHandler("force_check_amazon", force_check_amazon))
     app.add_handler(CommandHandler("force_top10", force_top10))
+    app.add_handler(CommandHandler("queue", queue_status))
+    app.add_handler(CommandHandler("force_dispatch", force_dispatch))
 
     add_product_handler = ConversationHandler(
         entry_points=[CommandHandler("add_product", add_product_start)],
@@ -1395,12 +1551,14 @@ def main():
 
     # Jobs
     job_queue = app.job_queue
-    # Seed inicial 30s depois de subir + 1x/dia (a cada 24h)
-    job_queue.run_repeating(seed_bestsellers_task, interval=86400, first=30)
+    # Seed inicial 30s depois de subir + a cada 6h (mais novidades ao longo do dia)
+    job_queue.run_repeating(seed_bestsellers_task, interval=21600, first=30)
     # ML: API oficial, aguenta rodar de 15 em 15min (primeira 3min após subir)
     job_queue.run_repeating(check_ml_task, interval=900, first=180)
     # Amazon: scraping frágil, 1 em 1h (primeira 5min após subir, escalonado do ML)
     job_queue.run_repeating(check_amazon_task, interval=3600, first=300)
+    # Dispatcher: manda 1 alerta da fila a cada ALERT_INTERVAL_SECONDS (default 5min)
+    job_queue.run_repeating(dispatch_pending_alerts_task, interval=ALERT_INTERVAL_SECONDS, first=90)
     # Resumo diário top 10 às 20h
     job_queue.run_daily(send_daily_top_10, time=datetime.strptime("20:00", "%H:%M").time())
 
