@@ -49,6 +49,8 @@ MERCADOLIVRE_CLIENT_ID = os.getenv("MERCADOLIVRE_CLIENT_ID", "")
 MERCADOLIVRE_CLIENT_SECRET = os.getenv("MERCADOLIVRE_CLIENT_SECRET", "")
 # Cookie de sessão do painel de afiliado (renovar quando expirar — normalmente ~30 dias)
 MERCADOLIVRE_COOKIE = os.getenv("MERCADOLIVRE_COOKIE", "")
+# Chat_id do admin (Felipe) — pra receber alertas do bot em privado (ex: cookie ML expirado)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip() or None
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -256,7 +258,7 @@ class Database:
             return []
 
     def should_alert(self, product: dict, current_price: float,
-                     min_drop_pct: float = 0.10, days_cooldown: int = 7,
+                     min_drop_pct: float = 0.10, days_cooldown: int = 2,
                      min_hours_between: int = 24) -> bool:
         """True se pode enviar alerta novo. Le last_alerted_at FRESCO do DB pra evitar race
         condition entre execucoes paralelas (ex: dois check_amazon_task simultaneos).
@@ -264,8 +266,8 @@ class Database:
         Regras:
         - nunca alertou → alerta
         - dentro de min_hours_between (24h) desde ultimo alerta → NUNCA realerta
-        - passou days_cooldown (7 dias) → pode realertar mesmo com mesmo preco
-        - entre 24h e 7 dias → so realerta se preco caiu +10% desde ultimo alerta
+        - passou days_cooldown (2 dias) → pode realertar mesmo com mesmo preco
+        - entre 24h e 2 dias → so realerta se preco caiu +10% desde ultimo alerta
         """
         if self.db is None:
             return True
@@ -676,40 +678,53 @@ class PriceScraper:
         return None
 
     def get_ml_price(self, product: dict) -> Optional[Dict]:
-        """Usa API do ML pra pegar preço atualizado do item."""
-        item_id = product.get('ml_item_id')
-        if not item_id:
-            # Fallback: tenta extrair "MLB-NNN" ou "MLBNNN" da URL
-            import re
-            match = re.search(r'MLB-?(\d+)', product.get('url', ''))
-            if match:
-                item_id = f"MLB{match.group(1)}"
-
-        if not item_id:
+        """Scrapa a página do produto ML pra pegar preço atualizado. Requer MERCADOLIVRE_COOKIE
+        (sem cookie o ML redireciona pra verificação anti-bot)."""
+        url = product.get('url')
+        if not url or not MERCADOLIVRE_COOKIE:
             return None
 
-        url = f"https://api.mercadolibre.com/items/{item_id}"
-        resp = _http_get_ml(url)
-        if not resp:
-            return None
         try:
-            data = resp.json()
-        except Exception:
+            resp = requests.get(
+                url,
+                headers={
+                    'User-Agent': random.choice(USER_AGENTS),
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept-Language': 'pt-BR,pt;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Cookie': MERCADOLIVRE_COOKIE,
+                    'Referer': 'https://www.mercadolivre.com.br/ofertas',
+                },
+                timeout=15,
+                allow_redirects=True,
+            )
+        except requests.RequestException as e:
+            logger.warning(f"⚠️ Erro get_ml_price {url[:60]}: {e}")
             return None
 
-        price = data.get('price')
-        list_price = data.get('original_price')
+        if resp.status_code != 200 or 'account-verification' in resp.url:
+            logger.warning(f"⚠️ ML bloqueou {url[:60]} (status {resp.status_code}, final={resp.url[:60]})")
+            return None
+
+        soup = BeautifulSoup(resp.content, 'html.parser')
+
+        # meta itemprop=price vem em formato inglês (ex: "1279.90"), não usar _parse_price
+        meta_price = soup.select_one('meta[itemprop="price"]')
+        price = None
+        if meta_price:
+            try:
+                price = float(meta_price.get('content'))
+            except (ValueError, TypeError):
+                pass
+
+        prev_el = soup.select_one('s.andes-money-amount--previous .andes-money-amount__fraction')
+        list_price = _parse_price(prev_el.get_text(strip=True)) if prev_el else None
+
+        og_image = soup.select_one('meta[property="og:image"]')
+        image_url = og_image.get('content') if og_image else None
+
         if not price:
             return None
-
-        # Pega imagem em alta resolução do array 'pictures'
-        pictures = data.get('pictures') or []
-        image_url = None
-        if pictures:
-            image_url = pictures[0].get('secure_url') or pictures[0].get('url')
-        # Fallback: thumbnail se não achou nada
-        if not image_url:
-            image_url = data.get('thumbnail')
 
         return {
             'price': float(price),
@@ -858,7 +873,7 @@ Considera desconto quando o preço cai 15%+ em relação a:
 - Mínimo histórico
 
 4️⃣ <b>ALERTAS EM TEMPO REAL</b>
-Assim que detecta desconto, manda a oferta direto pra você (com foto). Sem spam: cooldown mínimo de 24h por produto; só realerta antes de 7 dias se o preço cair mais 10%.
+Assim que detecta desconto, manda a oferta direto pra você (com foto). Sem spam: cooldown mínimo de 24h por produto; só realerta antes de 2 dias se o preço cair mais 10%.
 
 5️⃣ <b>RESUMO DIÁRIO</b>
 Todo dia às 20h, top 10 das melhores ofertas das últimas 24h.
@@ -866,6 +881,15 @@ Todo dia às 20h, top 10 das melhores ofertas das últimas 24h.
 <b>Dúvidas?</b> É só mandar mensagem.
     """
     await update.message.reply_text(help_text, parse_mode='HTML')
+
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        f"🆔 Seu chat_id: <code>{chat_id}</code>\n\n"
+        f"Coloca em <code>ADMIN_CHAT_ID</code> no <code>.env</code> pra receber alertas do bot em privado.",
+        parse_mode='HTML',
+    )
 
 
 async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1192,6 +1216,20 @@ async def _check_amazon_impl(context: ContextTypes.DEFAULT_TYPE):
 _ml_cookie_warned_expired = False
 
 
+def _notify_admin(msg: str):
+    """Envia mensagem privada pro admin (Felipe) via API HTTP do Telegram — funciona em código sync."""
+    if not ADMIN_CHAT_ID or not TELEGRAM_TOKEN:
+        return
+    try:
+        requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+            data={'chat_id': ADMIN_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao notificar admin: {e}")
+
+
 def _ml_affiliate_shortlink(long_url: str) -> Optional[str]:
     """Chama API do painel de afiliado ML pra gerar meli.la/xxx. Cacheia no Mongo (links são permanentes)."""
     global _ml_cookie_warned_expired
@@ -1231,6 +1269,11 @@ def _ml_affiliate_shortlink(long_url: str) -> Optional[str]:
     if resp.status_code in (401, 403):
         if not _ml_cookie_warned_expired:
             logger.error(f"❌ Cookie ML expirado (HTTP {resp.status_code}) — renove MERCADOLIVRE_COOKIE no .env")
+            _notify_admin(
+                f"⚠️ <b>Cookie ML expirado</b> (HTTP {resp.status_code})\n\n"
+                f"Renove <code>MERCADOLIVRE_COOKIE</code> no <code>.env</code> do server.\n"
+                f"Enquanto isso, links do ML vão sair sem afiliado (sem comissão)."
+            )
             _ml_cookie_warned_expired = True
         return None
 
@@ -1319,6 +1362,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("list_products", list_products))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CommandHandler("force_seed", force_seed))
     app.add_handler(CommandHandler("force_check_ml", force_check_ml))
     app.add_handler(CommandHandler("force_check_amazon", force_check_amazon))
