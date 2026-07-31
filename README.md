@@ -14,7 +14,7 @@ Projeto pessoal de estudo — foco em async, MongoDB, scraping e API do Telegram
    - Média dos últimos 30 dias
    - Preço "de/por" original
    - Mínimo histórico
-4. **Alerta em cadência constante:** quando detecta desconto, entra na fila. Dispatcher manda **1 mensagem a cada 5min** (com foto) pra não flodar nem ficar em silêncio. Maior desconto pendente sai primeiro.
+4. **Alerta em cadência constante:** quando detecta desconto, entra na fila. Dispatcher manda **1 mensagem a cada 5min** (com foto) das **09h às 23h BRT** — fora dessa janela a fila continua acumulando, mas nada é postado (pra não incomodar de madrugada). Maior desconto pendente sai primeiro.
 5. **Dedupe anti-spam:** cooldown de 8h por produto (24h + queda +10% pra realertar antes)
 6. **Resumo diário 20h:** top 10 dos melhores descontos das últimas 24h
 

@@ -8,7 +8,7 @@ import os
 import random
 import logging
 import statistics
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
@@ -38,8 +38,27 @@ SCRAPE_DELAY_RANGE = (2, 4)     # delay aleatório entre requests (segundos)
 # Cadência do canal: dispatcher manda 1 alerta enfileirado a cada X segundos.
 # Evita rajadas (24 msgs em 2min → silêncio o dia inteiro) e mantém canal ativo.
 ALERT_INTERVAL_SECONDS = int(os.getenv('ALERT_INTERVAL_SECONDS', '300'))
-# TTL de alerta na fila — se ficou mais que isso pendente, descarta (oferta velha)
-ALERT_QUEUE_TTL_HOURS = int(os.getenv('ALERT_QUEUE_TTL_HOURS', '12'))
+# TTL de alerta na fila — se ficou mais que isso pendente, descarta (oferta velha).
+# Precisa cobrir a janela silenciosa (10h) + tempo de esvaziar fila (~4h) com folga.
+ALERT_QUEUE_TTL_HOURS = int(os.getenv('ALERT_QUEUE_TTL_HOURS', '24'))
+# Quiet hours (BRT, UTC-3): fora dessa janela dispatcher segura alertas na fila.
+# Default: silencia 23h-09h BRT (canal só posta 09h-23h). Aceita janela cruzando meia-noite.
+QUIET_HOURS_START_BRT = int(os.getenv('QUIET_HOURS_START_BRT', '23'))
+QUIET_HOURS_END_BRT = int(os.getenv('QUIET_HOURS_END_BRT', '9'))
+BRT_TZ = timezone(timedelta(hours=-3))
+
+
+def _is_quiet_hours() -> bool:
+    """True quando estamos dentro da janela silenciosa (BRT). Dispatcher pausa envios,
+    mas o check continua enfileirando normalmente pra reserva."""
+    hour = datetime.now(BRT_TZ).hour
+    if QUIET_HOURS_START_BRT == QUIET_HOURS_END_BRT:
+        return False  # desativado
+    if QUIET_HOURS_START_BRT < QUIET_HOURS_END_BRT:
+        # janela dentro do mesmo dia (ex: 1h-6h)
+        return QUIET_HOURS_START_BRT <= hour < QUIET_HOURS_END_BRT
+    # janela cruzando meia-noite (default 23h-9h): silencia se hora >= start OU hora < end
+    return hour >= QUIET_HOURS_START_BRT or hour < QUIET_HOURS_END_BRT
 
 # Amazon: URLs de bestsellers por categoria (mais variedade que a home)
 AMAZON_BESTSELLER_URLS = [
@@ -967,7 +986,7 @@ Considera desconto quando o preço cai 15%+ em relação a:
 - Mínimo histórico
 
 4️⃣ <b>ALERTAS EM CADÊNCIA CONSTANTE</b>
-Quando detecta desconto, entra na fila. O canal recebe 1 oferta a cada 5min (com foto). Sem rajadas nem silêncio: melhor desconto pendente sai primeiro. Cooldown de 8h por produto (24h + queda de 10% pra realertar).
+Quando detecta desconto, entra na fila. O canal recebe 1 oferta a cada 5min (com foto) das <b>09h às 23h</b>. Fora dessa janela a fila continua acumulando, mas nada é postado — pra não incomodar de madrugada. Melhor desconto pendente sai primeiro. Cooldown de 8h por produto.
 
 5️⃣ <b>RESUMO DIÁRIO</b>
 Todo dia às 20h, top 10 das melhores ofertas das últimas 24h.
@@ -1021,6 +1040,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⏰ Agora: {datetime.now().strftime('%d/%m %H:%M')}
 
 🎯 Cadência do canal: 1 alerta a cada {interval_min} min
+🕒 Janela ativa: {QUIET_HOURS_END_BRT:02d}h-{QUIET_HOURS_START_BRT:02d}h BRT
     """
     await update.message.reply_text(stats_text, parse_mode='HTML')
 
@@ -1059,14 +1079,17 @@ async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra quantos alertas estão pendentes na fila do dispatcher."""
     pending = db.get_pending_count()
     interval_min = ALERT_INTERVAL_SECONDS // 60
+    quiet = _is_quiet_hours()
+    quiet_line = f"\n🌙 <b>Janela silenciosa ativa</b> ({QUIET_HOURS_START_BRT:02d}h-{QUIET_HOURS_END_BRT:02d}h BRT) — fila segurando" if quiet else ""
     if pending == 0:
-        await update.message.reply_text("📭 Fila vazia — nenhum alerta pendente.")
+        await update.message.reply_text(f"📭 Fila vazia — nenhum alerta pendente.{quiet_line}", parse_mode='HTML')
         return
     eta_min = pending * interval_min
     await update.message.reply_text(
         f"📬 <b>{pending}</b> alerta(s) na fila\n"
         f"⏱️ Cadência: 1 msg a cada {interval_min} min\n"
-        f"⏳ ETA pra esvaziar: ~{eta_min} min",
+        f"⏳ ETA pra esvaziar: ~{eta_min} min"
+        f"{quiet_line}",
         parse_mode='HTML'
     )
 
@@ -1254,7 +1277,10 @@ _dispatch_lock = asyncio.Lock()
 
 async def dispatch_pending_alerts_task(context: ContextTypes.DEFAULT_TYPE):
     """A cada ALERT_INTERVAL_SECONDS: puxa 1 alerta da fila (maior desconto primeiro),
-    envia e marca como alertado. Mantem cadencia constante no canal."""
+    envia e marca como alertado. Mantem cadencia constante no canal.
+    Durante quiet hours (default 23h-09h BRT), pula envio — fila continua acumulando."""
+    if _is_quiet_hours():
+        return
     if _dispatch_lock.locked():
         return
     async with _dispatch_lock:
