@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
@@ -35,6 +37,7 @@ def _check_and_clear_flag() -> bool:
             ["ssh", "-i", ORACLE_KEY, "-o", "StrictHostKeyChecking=no",
              "-o", "ConnectTimeout=10", ORACLE_HOST, cmd],
             capture_output=True, text=True, timeout=20,
+            creationflags=CREATE_NO_WINDOW,
         )
         _ssh_broken_notified = False
         return "present" in result.stdout
@@ -56,6 +59,7 @@ def _recreate_flag() -> None:
             ["ssh", "-i", ORACLE_KEY, "-o", "StrictHostKeyChecking=no",
              ORACLE_HOST, f"touch {FLAG_PATH}"],
             check=True, timeout=15,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception:
         pass

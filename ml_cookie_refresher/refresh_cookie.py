@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from urllib import parse, request
 
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
@@ -133,11 +135,11 @@ def _sync_to_oracle(cookie: str) -> bool:
     try:
         subprocess.run(
             ["scp", "-i", ORACLE_KEY, str(COOKIE_TMP), f"{ORACLE_HOST}:/tmp/ml_cookie.txt"],
-            check=True,
+            check=True, creationflags=CREATE_NO_WINDOW,
         )
         subprocess.run(
             ["ssh", "-i", ORACLE_KEY, ORACLE_HOST, remote_cmd],
-            check=True,
+            check=True, creationflags=CREATE_NO_WINDOW,
         )
         return True
     except subprocess.CalledProcessError as exc:
