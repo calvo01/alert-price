@@ -1447,12 +1447,17 @@ def _ml_affiliate_shortlink(long_url: str) -> Optional[str]:
         return None
 
     if resp.status_code in (401, 403):
+        # Sinaliza pro watcher no PC do Felipe rodar o refresh automatico.
+        try:
+            open("/home/ubuntu/alerta_bot/COOKIE_NEEDS_REFRESH", "w").close()
+        except OSError:
+            pass
         if not _ml_cookie_warned_expired:
-            logger.error(f"❌ Cookie ML expirado (HTTP {resp.status_code}) — renove MERCADOLIVRE_COOKIE no .env")
+            logger.error(f"❌ Cookie ML expirado (HTTP {resp.status_code}) — refresh automatico disparado")
             _notify_admin(
                 f"⚠️ <b>Cookie ML expirado</b> (HTTP {resp.status_code})\n\n"
-                f"Renove <code>MERCADOLIVRE_COOKIE</code> no <code>.env</code> do server.\n"
-                f"Enquanto isso, links do ML vão sair sem afiliado (sem comissão)."
+                f"Refresh automatico foi disparado. Aguardando reconexao...\n"
+                f"Enquanto isso, links do ML vão sair sem afiliado."
             )
             _ml_cookie_warned_expired = True
         return None
