@@ -791,16 +791,21 @@ class PriceScraper:
 
     def get_ml_price(self, product: dict) -> Optional[Dict]:
         """Scrapa a página do produto ML pra pegar preço atualizado. Requer MERCADOLIVRE_COOKIE
-        (sem cookie o ML redireciona pra verificação anti-bot)."""
+        (sem cookie o ML redireciona pra verificação anti-bot).
+
+        Retorna dict com 'blocked_by_verification' quando ML redireciona pra
+        /gz/account-verification — o caller usa isso pra abrir circuit breaker."""
         url = product.get('url')
         if not url or not MERCADOLIVRE_COOKIE:
             return None
 
         try:
+            # UA fixo (mesmo do cookie) — rotacionar UA com cookie fixo é padrao
+            # bot obvio pro antifraude do ML e faz a conta ser flagada.
             resp = requests.get(
                 url,
                 headers={
-                    'User-Agent': random.choice(USER_AGENTS),
+                    'User-Agent': ML_SESSION_UA,
                     'Accept-Encoding': 'gzip, deflate',
                     'Accept-Language': 'pt-BR,pt;q=0.9',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -814,7 +819,10 @@ class PriceScraper:
             logger.warning(f"⚠️ Erro get_ml_price {url[:60]}: {e}")
             return None
 
-        if resp.status_code != 200 or 'account-verification' in resp.url:
+        if 'account-verification' in resp.url:
+            logger.warning(f"⚠️ ML exigindo verificacao ({url[:60]}) — sinaliza circuit breaker")
+            return {'blocked_by_verification': True}
+        if resp.status_code != 200:
             logger.warning(f"⚠️ ML bloqueou {url[:60]} (status {resp.status_code}, final={resp.url[:60]})")
             return None
 
@@ -1244,9 +1252,14 @@ async def _check_and_alert_product(context: ContextTypes.DEFAULT_TYPE, product: 
     """Checa preço de 1 produto, salva no histórico, e se for desconto novo enfileira alerta.
     O dispatcher (dispatch_pending_alerts_task) envia da fila em cadência controlada.
     Retorna dict {name, percent_off} se enfileirou, senão None."""
+    global _ml_verification_blocked
     try:
         data = await asyncio.to_thread(price_scraper.get_price, product)
         if not data:
+            return None
+        # ML antifraude sinalizou verificacao — acende breaker e sai.
+        if data.get('blocked_by_verification'):
+            _ml_verification_blocked = True
             return None
         db.add_price_history(
             product['_id'],
@@ -1348,9 +1361,28 @@ async def _send_discount_alert(context: ContextTypes.DEFAULT_TYPE, product: dict
 _ml_check_lock = asyncio.Lock()
 _amazon_check_lock = asyncio.Lock()
 
+# Circuit breaker do ML: quando o antifraude comeca a redirecionar pra
+# /gz/account-verification, continuar batendo so reforca o flag da conta.
+# _get_ml_price seta essa flag quando detecta o redirect; o check aborta
+# assim que ela liga e pausa novos ciclos ate MLCOOLDOWN_UNTIL.
+_ml_verification_blocked = False
+_ml_cooldown_until: Optional[datetime] = None
+ML_VERIFICATION_COOLDOWN_HOURS = 2
+
 
 async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
-    """A cada 15min: checa produtos ML e alerta na hora quando acha desconto."""
+    """A cada 30min: checa produtos ML e alerta na hora quando acha desconto.
+    Se o circuit breaker do antifraude estiver aberto, pula o ciclo."""
+    global _ml_cooldown_until, _ml_verification_blocked
+    if _ml_cooldown_until and datetime.now() < _ml_cooldown_until:
+        remaining = int((_ml_cooldown_until - datetime.now()).total_seconds() / 60)
+        logger.info(f"🟡 ML check pulado — cooldown do antifraude ({remaining}min restantes)")
+        return
+    # cooldown expirou: reseta breaker e tenta de novo
+    if _ml_cooldown_until:
+        logger.info("🟡 Cooldown do antifraude expirou, retomando checks ML")
+        _ml_cooldown_until = None
+        _ml_verification_blocked = False
     if _ml_check_lock.locked():
         logger.warning("🟡 check_ml_task ja rodando — pulando execucao paralela")
         return
@@ -1359,6 +1391,8 @@ async def check_ml_task(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _check_ml_impl(context: ContextTypes.DEFAULT_TYPE):
+    global _ml_verification_blocked, _ml_cooldown_until
+    _ml_verification_blocked = False
     products = db.get_products_by_marketplace('mercadolivre')
     logger.info(f"🟡 ML check — {len(products)} produtos")
     enqueued = 0
@@ -1366,7 +1400,24 @@ async def _check_ml_impl(context: ContextTypes.DEFAULT_TYPE):
         result = await _check_and_alert_product(context, product)
         if result:
             enqueued += 1
-        await asyncio.sleep(random.uniform(0.3, 0.8))
+        # Se qualquer request detectou redirect pra /account-verification,
+        # aborta o ciclo inteiro. Continuar batendo so piora o flag da conta.
+        if _ml_verification_blocked:
+            _ml_cooldown_until = datetime.now() + timedelta(hours=ML_VERIFICATION_COOLDOWN_HOURS)
+            logger.error(
+                f"🛑 Circuit breaker ML ativado — antifraude exigindo verificacao. "
+                f"Cooldown ate {_ml_cooldown_until:%H:%M}"
+            )
+            _notify_admin(
+                f"🛑 <b>ML antifraude detectado</b>\n\n"
+                f"Ciclo abortado no produto {product.get('name', '?')[:60]}.\n"
+                f"Checks pausados por {ML_VERIFICATION_COOLDOWN_HOURS}h "
+                f"(retomam apos {_ml_cooldown_until:%H:%M})."
+            )
+            break
+        # Delay maior e mais variavel — 0.3-0.8s era muito uniforme e triggou
+        # o antifraude. 2-5s reduz volume de req/h e parece mais humano.
+        await asyncio.sleep(random.uniform(2.0, 5.0))
     pending = db.get_pending_count()
     logger.info(f"🟡 ML check concluído — {enqueued} novos enfileirados (fila total: {pending})")
 
@@ -1592,8 +1643,9 @@ def main():
     job_queue = app.job_queue
     # Seed inicial 30s depois de subir + a cada 6h (mais novidades ao longo do dia)
     job_queue.run_repeating(seed_bestsellers_task, interval=21600, first=30)
-    # ML: API oficial, aguenta rodar de 15 em 15min (primeira 3min após subir)
-    job_queue.run_repeating(check_ml_task, interval=900, first=180)
+    # ML: scraping HTML com cookie. 30min pra reduzir volume de req/h e evitar
+    # trigger do antifraude (dispatcher do canal já limita a 1 msg/5min).
+    job_queue.run_repeating(check_ml_task, interval=1800, first=180)
     # Amazon: scraping frágil, 1 em 1h (primeira 5min após subir, escalonado do ML)
     job_queue.run_repeating(check_amazon_task, interval=3600, first=300)
     # Dispatcher: manda 1 alerta da fila a cada ALERT_INTERVAL_SECONDS (default 5min)
