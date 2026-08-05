@@ -74,7 +74,7 @@ MERCADOLIVRE_CLIENT_ID = os.getenv("MERCADOLIVRE_CLIENT_ID", "")
 MERCADOLIVRE_CLIENT_SECRET = os.getenv("MERCADOLIVRE_CLIENT_SECRET", "")
 # Cookie de sessão do painel de afiliado (renovar quando expirar — normalmente ~30 dias)
 MERCADOLIVRE_COOKIE = os.getenv("MERCADOLIVRE_COOKIE", "")
-# Chat_id do admin (Felipe) — pra receber alertas do bot em privado (ex: cookie ML expirado)
+# Chat_id do admin — pra receber alertas do bot em privado (ex: cookie ML expirado)
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip() or None
 
 USER_AGENTS = [
@@ -1395,9 +1395,17 @@ async def _check_amazon_impl(context: ContextTypes.DEFAULT_TYPE):
 
 _ml_cookie_warned_expired = False
 
+# Mesmo UA usado por ml_cookie_refresher/refresh_cookie.py ao extrair o cookie.
+# Fingerprint precisa ser estavel entre login e uso, senao ML invalida sessao rapido.
+ML_SESSION_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
 
 def _notify_admin(msg: str):
-    """Envia mensagem privada pro admin (Felipe) via API HTTP do Telegram — funciona em código sync."""
+    """Envia mensagem privada pro admin via API HTTP do Telegram — funciona em código sync."""
     if not ADMIN_CHAT_ID or not TELEGRAM_TOKEN:
         return
     try:
@@ -1431,7 +1439,7 @@ def _ml_affiliate_shortlink(long_url: str) -> Optional[str]:
             'https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink',
             json={'urls': [long_url], 'tag': MERCADOLIVRE_AFFILIATE_TAG},
             headers={
-                'User-Agent': random.choice(USER_AGENTS),
+                'User-Agent': ML_SESSION_UA,
                 'Accept': 'application/json, text/plain, */*',
                 'Content-Type': 'application/json;charset=UTF-8',
                 'Cookie': MERCADOLIVRE_COOKIE,
@@ -1447,7 +1455,7 @@ def _ml_affiliate_shortlink(long_url: str) -> Optional[str]:
         return None
 
     if resp.status_code in (401, 403):
-        # Sinaliza pro watcher no PC do Felipe rodar o refresh automatico.
+        # Sinaliza pro watcher local rodar o refresh automatico.
         try:
             open("/home/ubuntu/alerta_bot/COOKIE_NEEDS_REFRESH", "w").close()
         except OSError:

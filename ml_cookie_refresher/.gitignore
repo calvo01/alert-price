@@ -2,3 +2,5 @@ venv/
 chrome_profile/
 cookie.txt
 watcher.log
+watcher.pid
+PAUSED_UNTIL_MANUAL

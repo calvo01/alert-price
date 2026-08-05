@@ -1,9 +1,12 @@
-"""Renova MERCADOLIVRE_COOKIE no Oracle a partir do painel de afiliado.
+"""Renova MERCADOLIVRE_COOKIE no servidor remoto a partir do painel de afiliado.
 
 Fluxo:
 1. Abre https://www.mercadolivre.com.br/afiliados/home em Chrome persistente (headless).
-2. Se ainda logado -> pega cookies, sobe pro Oracle via SCP, restarta o systemd.
-3. Se sessao caiu -> reabre em modo visivel, espera Felipe logar (ate 3min), repete.
+2. Se ainda logado -> pega cookies, sobe pro servidor via SCP, restarta o systemd.
+3. Se sessao caiu -> reabre em modo visivel, espera login manual (ate 3min), repete.
+
+Config via .env do bot: REFRESHER_SSH_HOST, REFRESHER_SSH_KEY, REFRESHER_REMOTE_ENV,
+REFRESHER_SYSTEMD_UNIT. Se nao setados, so faz login/extracao local — nao sincroniza.
 
 Alertas de falha vao pro Telegram (mesmo bot/admin do alerta_bot).
 """
@@ -23,11 +26,16 @@ BASE_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = BASE_DIR / "chrome_profile"
 COOKIE_TMP = BASE_DIR / "cookie.txt"
 BOT_ENV = BASE_DIR.parent / ".env"
+PAUSED_FLAG = BASE_DIR / "PAUSED_UNTIL_MANUAL"
 
-ORACLE_HOST = "ubuntu@163.176.219.29"
-ORACLE_KEY = r"C:\Users\feter\.ssh\oracle_bot"
-ENV_PATH = "/home/ubuntu/alerta_bot/.env"
-SYSTEMD_UNIT = "price-alert-bot"
+RC_OK = 0
+RC_TECH_ERROR = 1
+RC_NEEDS_MANUAL = 2
+
+SSH_HOST = ""
+SSH_KEY = ""
+REMOTE_ENV_PATH = ""
+SYSTEMD_UNIT = ""
 
 TARGET_URL = "https://www.mercadolivre.com.br/afiliados/home"
 USER_AGENT = (
@@ -53,6 +61,10 @@ def _read_env(path: Path) -> dict[str, str]:
 ENV = _read_env(BOT_ENV)
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "")
 ADMIN_CHAT_ID = ENV.get("ADMIN_CHAT_ID", "")
+SSH_HOST = ENV.get("REFRESHER_SSH_HOST", "")
+SSH_KEY = ENV.get("REFRESHER_SSH_KEY", "")
+REMOTE_ENV_PATH = ENV.get("REFRESHER_REMOTE_ENV", "/home/ubuntu/alerta_bot/.env")
+SYSTEMD_UNIT = ENV.get("REFRESHER_SYSTEMD_UNIT", "price-alert-bot")
 
 
 def _notify(msg: str) -> None:
@@ -124,28 +136,31 @@ def _grab_cookie() -> str | None:
     return None
 
 
-def _sync_to_oracle(cookie: str) -> bool:
+def _sync_to_remote(cookie: str) -> bool:
+    if not SSH_HOST or not SSH_KEY:
+        print("[INFO] SSH nao configurado (REFRESHER_SSH_HOST/KEY vazios), pulando sync remoto")
+        return True
     COOKIE_TMP.write_text(cookie, encoding="utf-8")
     remote_cmd = (
-        f"sed -i '/^MERCADOLIVRE_COOKIE=/d' {ENV_PATH} && "
-        f"printf 'MERCADOLIVRE_COOKIE=%s\\n' \"$(cat /tmp/ml_cookie.txt)\" >> {ENV_PATH} && "
+        f"sed -i '/^MERCADOLIVRE_COOKIE=/d' {REMOTE_ENV_PATH} && "
+        f"printf 'MERCADOLIVRE_COOKIE=%s\\n' \"$(cat /tmp/ml_cookie.txt)\" >> {REMOTE_ENV_PATH} && "
         f"rm /tmp/ml_cookie.txt && "
         f"sudo systemctl restart {SYSTEMD_UNIT}"
     )
     try:
         subprocess.run(
-            ["scp", "-i", ORACLE_KEY, str(COOKIE_TMP), f"{ORACLE_HOST}:/tmp/ml_cookie.txt"],
+            ["scp", "-i", SSH_KEY, str(COOKIE_TMP), f"{SSH_HOST}:/tmp/ml_cookie.txt"],
             check=True, creationflags=CREATE_NO_WINDOW,
         )
         subprocess.run(
-            ["ssh", "-i", ORACLE_KEY, ORACLE_HOST, remote_cmd],
+            ["ssh", "-i", SSH_KEY, SSH_HOST, remote_cmd],
             check=True, creationflags=CREATE_NO_WINDOW,
         )
         return True
     except subprocess.CalledProcessError as exc:
         _notify(
             "\u26a0\ufe0f <b>Refresher ML falhou</b>\n"
-            f"Sync com Oracle deu erro: <code>{exc}</code>"
+            f"Sync remoto deu erro: <code>{exc}</code>"
         )
         return False
     finally:
@@ -161,25 +176,26 @@ def main() -> int:
             "\u26a0\ufe0f <b>Refresher ML crashou</b>\n"
             f"<code>{type(exc).__name__}: {exc}</code>"
         )
-        raise
+        return RC_TECH_ERROR
 
     if not cookie:
+        PAUSED_FLAG.write_text("sessao ML expirou, precisa login manual", encoding="utf-8")
         _notify(
-            "\ud83d\udd10 <b>Refresher ML: sessao expirou</b>\n"
-            "Rode manualmente <code>run.bat</code> pra fazer login no ML.\n"
+            "\ud83d\udd10 <b>Refresher ML: precisa login manual</b>\n"
+            "ML agora exige validacao facial. Watcher pausado ate voce rodar <code>run.bat</code>.\n"
             "Enquanto isso, links saem sem afiliado."
         )
-        return 1
+        return RC_NEEDS_MANUAL
 
-    if _sync_to_oracle(cookie):
-        print("[OK] cookie renovado, bot reiniciado no Oracle")
+    if _sync_to_remote(cookie):
+        PAUSED_FLAG.unlink(missing_ok=True)
+        print("[OK] cookie renovado, bot reiniciado no servidor remoto")
         _notify(
             "\u2705 <b>Cookie ML reconectado</b>\n"
-            "Renovacao automatica concluida, bot reiniciado.\n"
-            "Links do ML voltam a sair com afiliado."
+            "Renovacao concluida, bot reiniciado. Watcher retomado."
         )
-        return 0
-    return 1
+        return RC_OK
+    return RC_TECH_ERROR
 
 
 if __name__ == "__main__":
